@@ -155,7 +155,7 @@ TDD build + local deploy complete. Branch `aeonia/v1` on `Aeonia-ai/aeonia-agent
 | 3 — roles re-skin (boot-from-KOS-thread) + dynamic categories | ✅ done, TDD (`72861f0`) — 8 tests |
 | 4 — shared-token auth (REST + Socket.IO) | ✅ done, TDD (`8d2e7b2`) — 7 tests |
 | **deploy (local)** | ✅ hub runs on :3030, auth enforced (401/200/401), live round-trip verified (join → send → read → task, all 200) |
-| 2 — transport adapter (Matrix seam) | ⏳ next (build) |
+| 2 — transport adapter (Matrix seam) | ✅ done, TDD — 4 tests; `mcp-server.js` transport-free; `MatrixTransport` stub ready for v2 |
 | 5 — Weymouth/Tailscale deploy | ⏳ documented below; needs operator go (remote control-plane) |
 | 6 — full 2-agent loop (two live Claude sessions) | ⏳ needs Jason to open two sessions |
 | 8 — Matrix v2 | later |

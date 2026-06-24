@@ -2,27 +2,21 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import axios from "axios";
-import { io } from "socket.io-client";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createTransport } from "./transport/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.CHAT_SERVER_URL || "http://localhost:3000";
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");
 const HUB_AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// Send the shared token on every axios request when configured
-if (HUB_AUTH_TOKEN) {
-  axios.defaults.headers.common['x-auth-token'] = HUB_AUTH_TOKEN;
-}
-
 // Global state
 let currentAgentId = null;
 let currentRoom = null;
-let socket = null;
+let transport = null;
 let agentName = process.env.AGENT_NAME || `Agent-${uuidv4().slice(0, 8)}`;
 let notifications = [];
 let messageHistory = [];
@@ -36,85 +30,6 @@ async function ensureSharedDir() {
     await fs.mkdir(SHARED_DIR, { recursive: true });
     console.error(`Created shared directory: ${SHARED_DIR}`);
   }
-}
-
-// Initialize socket connection
-function connectSocket() {
-  if (socket) socket.disconnect();
-
-  socket = io(SERVER_URL, {
-    auth: HUB_AUTH_TOKEN ? { token: HUB_AUTH_TOKEN } : {},
-  });
-
-  socket.on("connect", () => {
-    console.error(`[${agentName}] Connected to chat server at ${SERVER_URL}`);
-    if (currentAgentId && currentRoom) {
-      socket.emit("register", { agentId: currentAgentId, room: currentRoom });
-    }
-  });
-
-  socket.on("message", (message) => {
-    messageHistory.push(message);
-    // Keep only last 1000 messages
-    if (messageHistory.length > 1000) {
-      messageHistory = messageHistory.slice(-1000);
-    }
-
-    // Check for notifications
-    const content = message.content?.toLowerCase() || "";
-    if (message.mentions?.includes(agentName)) {
-      notifications.push({
-        id: uuidv4(),
-        type: "mention",
-        message: message,
-        timestamp: new Date().toISOString(),
-        read: false,
-      });
-    }
-
-    for (const pattern of watchPatterns) {
-      if (content.includes(pattern.toLowerCase())) {
-        notifications.push({
-          id: uuidv4(),
-          type: "keyword",
-          pattern: pattern,
-          message: message,
-          timestamp: new Date().toISOString(),
-          read: false,
-        });
-        break;
-      }
-    }
-
-    console.error(`[${message.agentName || "System"}]: ${message.content}`);
-  });
-
-  socket.on("notification", (notification) => {
-    notifications.push({
-      id: uuidv4(),
-      type: "system",
-      ...notification,
-      timestamp: new Date().toISOString(),
-      read: false,
-    });
-    console.error(`Notification: ${notification.message}`);
-  });
-
-  socket.on("task_assigned", (task) => {
-    notifications.push({
-      id: uuidv4(),
-      type: "task",
-      task: task,
-      message: `Task assigned: ${task.title}`,
-      timestamp: new Date().toISOString(),
-      read: false,
-    });
-    console.error(`Task Assigned: ${task.title}`);
-  });
-
-  socket.on("disconnect", () => {
-    console.error(`[${agentName}] Disconnected from chat server`);
-  });
 }
 
 // Create MCP server instance
@@ -149,25 +64,77 @@ server.registerTool(
     clearRoomCache();
 
     try {
-      const response = await axios.post(
-        `${SERVER_URL}/api/join/${params.roomName}`,
-        {
-          agentId: currentAgentId,
-          agentName: agentName,
-          capabilities: params.capabilities || {
-            role: "ai-agent",
-            type: "claude",
-          },
-        }
-      );
+      transport = createTransport({ serverUrl: SERVER_URL, authToken: HUB_AUTH_TOKEN, agentName });
 
-      connectSocket();
+      // Register socket event callbacks before connecting
+      transport.onMessage((message) => {
+        messageHistory.push(message);
+        // Keep only last 1000 messages
+        if (messageHistory.length > 1000) {
+          messageHistory = messageHistory.slice(-1000);
+        }
+
+        // Check for mentions
+        if (message.mentions?.includes(agentName)) {
+          notifications.push({
+            id: uuidv4(),
+            type: "mention",
+            message: message,
+            timestamp: new Date().toISOString(),
+            read: false,
+          });
+        }
+
+        for (const pattern of watchPatterns) {
+          const content = message.content?.toLowerCase() || "";
+          if (content.includes(pattern.toLowerCase())) {
+            notifications.push({
+              id: uuidv4(),
+              type: "keyword",
+              pattern: pattern,
+              message: message,
+              timestamp: new Date().toISOString(),
+              read: false,
+            });
+            break;
+          }
+        }
+
+        console.error(`[${message.agentName || "System"}]: ${message.content}`);
+      });
+
+      transport.onNotification((notifOrTask) => {
+        if (notifOrTask._taskAssigned) {
+          const task = notifOrTask.task;
+          notifications.push({
+            id: uuidv4(),
+            type: "task",
+            task: task,
+            message: `Task assigned: ${task.title}`,
+            timestamp: new Date().toISOString(),
+            read: false,
+          });
+          console.error(`Task Assigned: ${task.title}`);
+        } else {
+          const notification = notifOrTask;
+          notifications.push({
+            id: uuidv4(),
+            type: "system",
+            ...notification,
+            timestamp: new Date().toISOString(),
+            read: false,
+          });
+          console.error(`Notification: ${notification.message}`);
+        }
+      });
+
+      const response = await transport.connect(currentAgentId, params.roomName);
 
       return {
         content: [
           {
             type: "text",
-            text: `Successfully joined room: ${params.roomName}\nAgent ID: ${currentAgentId}\nAgent Name: ${agentName}\nCurrent Agents: ${response.data.currentAgents.length}`
+            text: `Successfully joined room: ${params.roomName}\nAgent ID: ${currentAgentId}\nAgent Name: ${agentName}\nCurrent Agents: ${response?.data?.currentAgents?.length ?? 0}`
           }
         ]
       };
@@ -206,16 +173,13 @@ server.registerTool(
     }
 
     try {
-      await axios.post(`${SERVER_URL}/api/leave/${currentAgentId}`);
-
-      if (socket) {
-        socket.disconnect();
-        socket = null;
-      }
+      await transport.leaveRoom(currentAgentId);
+      await transport.disconnect();
 
       const leftRoom = currentRoom;
       currentAgentId = null;
       currentRoom = null;
+      transport = null;
       messageHistory = [];
       notifications = [];
 
@@ -269,11 +233,7 @@ server.registerTool(
     }
 
     try {
-      await axios.post(`${SERVER_URL}/api/send`, {
-        agentId: currentAgentId,
-        content: params.content,
-        metadata: params.metadata || {},
-      });
+      await transport.sendMessage(params.content, params.metadata || {});
 
       return {
         content: [
@@ -321,7 +281,7 @@ server.registerTool(
     }
 
     try {
-      // First try to get from local history
+      // First try to get from local history (fast path — no network call)
       if (!params.since && messageHistory.length > 0) {
         const limit = params.limit || 50;
         const messages = messageHistory.slice(-limit);
@@ -336,15 +296,7 @@ server.registerTool(
       }
 
       // Otherwise fetch from server
-      const response = await axios.get(
-        `${SERVER_URL}/api/messages/${currentRoom}`,
-        {
-          params: {
-            since: params.since,
-            limit: params.limit || 50,
-          },
-        }
-      );
+      const response = await transport.getMessages(currentRoom, params.since, params.limit || 50);
 
       const messages = response.data.messages;
       return {
@@ -403,7 +355,7 @@ server.registerTool(
     }
 
     const unreadCount = notifications.filter((n) => !n.read).length;
-    const notificationList = filtered.map(n => 
+    const notificationList = filtered.map(n =>
       `[${n.type.toUpperCase()}] ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`
     ).join('\n');
 
@@ -444,16 +396,13 @@ server.registerTool(
     }
 
     try {
-      const response = await axios.post(
-        `${SERVER_URL}/api/tasks/${currentRoom}`,
-        {
-          title: params.title,
-          description: params.description,
-          assignee: params.assignee,
-          priority: params.priority || "medium",
-          creator: agentName,
-        }
-      );
+      await transport.createTask(currentRoom, {
+        title: params.title,
+        description: params.description,
+        assignee: params.assignee,
+        priority: params.priority || "medium",
+        creator: agentName,
+      });
 
       return {
         content: [
@@ -502,16 +451,14 @@ server.registerTool(
     }
 
     try {
-      const response = await axios.get(`${SERVER_URL}/api/tasks/${currentRoom}`, {
-        params: {
-          status: params.status,
-          assignee: params.assignee || agentName,
-          priority: params.priority,
-        },
+      const response = await transport.getTasks(currentRoom, {
+        status: params.status,
+        assignee: params.assignee || agentName,
+        priority: params.priority,
       });
 
       const tasks = response.data.tasks;
-      const taskList = tasks.map(task => 
+      const taskList = tasks.map(task =>
         `[${task.status.toUpperCase()}] ${task.title}\n  Description: ${task.description}\n  Assignee: ${task.assignee || 'Unassigned'}\n  Priority: ${task.priority}\n  Created: ${new Date(task.createdAt).toLocaleString()}`
       ).join('\n\n');
 
@@ -563,7 +510,7 @@ server.registerTool(
     }
 
     try {
-      await axios.post(`${SERVER_URL}/api/memory/${currentAgentId}`, {
+      await transport.storeMemory(currentAgentId, {
         key: params.key,
         value: params.value,
         type: params.type || "note",
@@ -616,16 +563,13 @@ server.registerTool(
     }
 
     try {
-      const queryParams = new URLSearchParams();
-      if (params.key) queryParams.append("key", params.key);
-      if (params.type) queryParams.append("type", params.type);
-
-      const response = await axios.get(
-        `${SERVER_URL}/api/memory/${currentAgentId}?${queryParams}`
-      );
+      const response = await transport.retrieveMemory(currentAgentId, {
+        key: params.key,
+        type: params.type,
+      });
 
       const memories = response.data.memories;
-      const memoryList = memories.map(m => 
+      const memoryList = memories.map(m =>
         `Key: ${m.key}\nValue: ${m.value}\nType: ${m.type || 'note'}\nCreated: ${new Date(m.created_at).toLocaleString()}`
       ).join('\n\n');
 
@@ -664,7 +608,7 @@ server.registerTool(
   async (params) => {
     try {
       const filePath = path.join(SHARED_DIR, params.filename);
-      
+
       // Security check - ensure file is within shared directory
       const resolvedPath = path.resolve(filePath);
       const resolvedSharedDir = path.resolve(SHARED_DIR);
@@ -716,7 +660,7 @@ server.registerTool(
   async (params) => {
     try {
       const filePath = path.join(SHARED_DIR, params.filename);
-      
+
       // Security check - ensure file is within shared directory
       const resolvedPath = path.resolve(filePath);
       const resolvedSharedDir = path.resolve(SHARED_DIR);
@@ -766,10 +710,10 @@ server.registerTool(
   },
   async (params) => {
     try {
-      const targetDir = params.subdirectory 
+      const targetDir = params.subdirectory
         ? path.join(SHARED_DIR, params.subdirectory)
         : SHARED_DIR;
-      
+
       // Security check - ensure directory is within shared directory
       const resolvedPath = path.resolve(targetDir);
       const resolvedSharedDir = path.resolve(SHARED_DIR);
@@ -836,8 +780,8 @@ async function main() {
 
   await ensureSharedDir();
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const stdioTransport = new StdioServerTransport();
+  await server.connect(stdioTransport);
 
   console.error(`MCP Server connected and ready for Claude`);
 }
