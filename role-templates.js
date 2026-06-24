@@ -1,7 +1,14 @@
 // Agent Role Templates for Symphony of One MCP
 // Predefined roles with prompts, tasks, and capabilities
+//
+// CUSTOMIZATION: set ROLES_CONFIG env var to an absolute path of a JSON file
+// with { roles, taskTemplates, quickAssignments } to override any or all defaults.
+// Example: ROLES_CONFIG=/path/to/my-roster.json
+// Any missing key falls back to the generic default.
 
-export const AGENT_ROLES = {
+import fs from "node:fs";
+
+const DEFAULT_AGENT_ROLES = {
   // Development Roles
   SENIOR_DEVELOPER: {
     name: "Senior Developer",
@@ -327,7 +334,7 @@ Provide thorough, unbiased research with actionable insights and clear recommend
   },
 };
 
-export const TASK_TEMPLATES = {
+const DEFAULT_TASK_TEMPLATES = {
   // Development Task Templates
   CODE_REVIEW: {
     title: "Code Review: {feature_name}",
@@ -447,7 +454,7 @@ export const TASK_TEMPLATES = {
   },
 };
 
-export const QUICK_ASSIGNMENTS = {
+const DEFAULT_QUICK_ASSIGNMENTS = {
   // Quick role-based assignments
   EMERGENCY_BUG_FIX: {
     title: "🚨 Emergency Bug Fix",
@@ -493,6 +500,38 @@ export const QUICK_ASSIGNMENTS = {
     template: "CODE_REVIEW",
   },
 };
+
+// ─── Config loading ───────────────────────────────────────────────────────────
+
+function _loadConfig() {
+  const configPath = process.env.ROLES_CONFIG;
+  if (configPath) {
+    try {
+      const raw = fs.readFileSync(configPath, "utf8");
+      const cfg = JSON.parse(raw);
+      return {
+        roles: cfg.roles ?? DEFAULT_AGENT_ROLES,
+        taskTemplates: cfg.taskTemplates ?? DEFAULT_TASK_TEMPLATES,
+        quickAssignments: cfg.quickAssignments ?? DEFAULT_QUICK_ASSIGNMENTS,
+      };
+    } catch (err) {
+      process.stderr.write(
+        `[role-templates] Warning: could not load ROLES_CONFIG="${configPath}": ${err.message}\n`
+      );
+    }
+  }
+  return {
+    roles: DEFAULT_AGENT_ROLES,
+    taskTemplates: DEFAULT_TASK_TEMPLATES,
+    quickAssignments: DEFAULT_QUICK_ASSIGNMENTS,
+  };
+}
+
+const _config = _loadConfig();
+
+export const AGENT_ROLES = _config.roles;
+export const TASK_TEMPLATES = _config.taskTemplates;
+export const QUICK_ASSIGNMENTS = _config.quickAssignments;
 
 // Helper functions for role management
 export function getRolesByCategory(category) {
