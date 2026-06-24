@@ -19,8 +19,38 @@ const io = new Server(httpServer, {
   },
 });
 
+// Socket.IO auth handshake middleware (AUTH_TOKEN resolved after io is created)
+// Note: AUTH_TOKEN const is defined below after express.json(); we use
+// process.env.AUTH_TOKEN directly here to avoid forward-reference issues.
+io.use((socket, next) => {
+  const authToken = process.env.AUTH_TOKEN || '';
+  if (!authToken) return next();           // open mode
+  const token =
+    socket.handshake.auth?.token ||
+    socket.handshake.headers?.['x-auth-token'] ||
+    null;
+  if (token === authToken) return next();
+  return next(new Error('Unauthorized'));
+});
+
 app.use(cors());
 app.use(express.json());
+
+// Shared-token auth (gracefully disabled when AUTH_TOKEN is unset)
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+
+// REST middleware: guard /api/* routes
+app.use('/api', (req, res, next) => {
+  if (!AUTH_TOKEN) return next();          // open mode
+  const bearer = req.headers['authorization'];
+  const xToken = req.headers['x-auth-token'];
+  const provided =
+    (bearer && bearer.startsWith('Bearer ') ? bearer.slice(7) : null) ||
+    xToken ||
+    null;
+  if (provided === AUTH_TOKEN) return next();
+  return res.status(401).json({ success: false, error: 'Unauthorized' });
+});
 
 // Configuration
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");

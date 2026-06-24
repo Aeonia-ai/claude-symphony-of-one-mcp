@@ -20,16 +20,19 @@ function randomPort() {
 }
 
 /**
- * Poll until GET /api/rooms returns HTTP 200, or throw after maxMs.
+ * Poll until GET /api/rooms returns any HTTP response (200 or 401),
+ * or throw after maxMs. Any HTTP response means the server is up;
+ * 401 is expected when AUTH_TOKEN is set.
  */
 async function waitForReady(port, maxMs = 8000) {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://localhost:${port}/api/rooms`);
-      if (res.ok) return;
+      await fetch(`http://localhost:${port}/api/rooms`);
+      // Any response (including 401) means the server is listening.
+      return;
     } catch {
-      // not up yet
+      // not up yet — connection refused or network error
     }
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -38,9 +41,10 @@ async function waitForReady(port, maxMs = 8000) {
 
 /**
  * Start a fresh server instance.
+ * @param {Record<string,string>} extraEnv  Optional env vars layered on top (e.g. { AUTH_TOKEN: 'secret' }).
  * Returns { port, dbPath, stop() }.
  */
-export async function startServer() {
+export async function startServer(extraEnv = {}) {
   const port = randomPort();
   const uid = randomUUID();
   const dbPath = path.join(os.tmpdir(), `test-${uid}.db`);
@@ -54,6 +58,7 @@ export async function startServer() {
       DB_PATH: dbPath,
       SHARED_DIR: sharedDir,
       DATA_DIR: dataDir,
+      ...extraEnv,
     },
     stdio: "pipe",
   });

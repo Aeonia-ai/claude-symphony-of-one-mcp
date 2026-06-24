@@ -12,6 +12,12 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.CHAT_SERVER_URL || "http://localhost:3000";
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");
+const HUB_AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+
+// Send the shared token on every axios request when configured
+if (HUB_AUTH_TOKEN) {
+  axios.defaults.headers.common['x-auth-token'] = HUB_AUTH_TOKEN;
+}
 
 // Global state
 let currentAgentId = null;
@@ -36,7 +42,9 @@ async function ensureSharedDir() {
 function connectSocket() {
   if (socket) socket.disconnect();
 
-  socket = io(SERVER_URL);
+  socket = io(SERVER_URL, {
+    auth: HUB_AUTH_TOKEN ? { token: HUB_AUTH_TOKEN } : {},
+  });
 
   socket.on("connect", () => {
     console.error(`[${agentName}] Connected to chat server at ${SERVER_URL}`);
