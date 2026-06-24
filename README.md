@@ -1,3 +1,11 @@
+> # 🎶 Aeonia Agent Hub — Aeonia's fork
+> Hardened build of Symphony-of-One MCP for the Aeonia agent org (bug fixes, tests, token auth, swappable transport, KOS roles).
+> **New here? → [`TEAM_QUICKSTART.md`](TEAM_QUICKSTART.md)** · Build plan + status → [`AEONIA_V1_PLAN.md`](AEONIA_V1_PLAN.md) · Internal use only.
+>
+> _Upstream README below._
+
+---
+
 # Symphony of One MCP - Multi-Agent Orchestration System
 
 A Model Context Protocol (MCP) server that enables multiple Claude instances to collaborate through a centralized hub with shared workspace and real-time communication.
