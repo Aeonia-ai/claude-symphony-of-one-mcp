@@ -17,7 +17,8 @@ export default class MatrixTransport extends Transport {
   onMessage()      { throw new Error('MatrixTransport not implemented — Phase 8'); }
   onNotification() { throw new Error('MatrixTransport not implemented — Phase 8'); }
   createTask()     { throw new Error('MatrixTransport not implemented — Phase 8'); }
-  getTasks()       { throw new Error('MatrixTransport not implemented — Phase 8'); }
+  getTasks()            { throw new Error('MatrixTransport not implemented — Phase 8'); }
+  getNotifications()    { throw new Error('MatrixTransport not implemented — Phase 8'); }
   updateTask()     { throw new Error('MatrixTransport not implemented — Phase 8'); }
   storeMemory()    { throw new Error('MatrixTransport not implemented — Phase 8'); }
   retrieveMemory() { throw new Error('MatrixTransport not implemented — Phase 8'); }

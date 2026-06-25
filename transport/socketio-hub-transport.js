@@ -160,6 +160,19 @@ export default class SocketIoHubTransport extends Transport {
   }
 
   /**
+   * GET /api/notifications/:agentId — fetch server-side notifications by
+   * agent ID and name so agents can retrieve @mentions they missed while offline.
+   * @param {string} agentId
+   * @param {string} agentName
+   * @param {boolean} unreadOnly
+   */
+  async getNotifications(agentId, agentName, unreadOnly) {
+    return this._axios.get(`/api/notifications/${agentId}`, {
+      params: { agentName, unreadOnly: unreadOnly ? 'true' : undefined },
+    });
+  }
+
+  /**
    * Register a callback invoked for every incoming 'message' socket event.
    * @param {function} cb
    */

@@ -349,7 +349,25 @@ server.registerTool(
       };
     }
 
-    let filtered = notifications;
+    let allNotifications = notifications;
+
+    // If local cache is empty, fetch from server — catches @mentions sent
+    // before this agent joined (the most common async coordination case).
+    if (allNotifications.length === 0) {
+      try {
+        const response = await transport.getNotifications(currentAgentId, agentName, params.unreadOnly);
+        const serverNotifs = (response.data?.notifications || []).map(n => ({
+          ...n,
+          read: !!n.is_read,
+          timestamp: n.created_at,
+        }));
+        allNotifications = serverNotifs;
+      } catch (_) {
+        // fall through to local (empty) list
+      }
+    }
+
+    let filtered = allNotifications;
 
     if (params.unreadOnly) {
       filtered = filtered.filter((n) => !n.read);
@@ -359,7 +377,7 @@ server.registerTool(
       filtered = filtered.filter((n) => n.type === params.type);
     }
 
-    const unreadCount = notifications.filter((n) => !n.read).length;
+    const unreadCount = allNotifications.filter((n) => !n.read).length;
     const notificationList = filtered.map(n =>
       `[${n.type.toUpperCase()}] ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`
     ).join('\n');

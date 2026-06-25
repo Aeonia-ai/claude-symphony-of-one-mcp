@@ -168,6 +168,7 @@ async function initializeSystem() {
       db.run(`CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY,
         agent_id TEXT,
+        agent_name TEXT,
         room TEXT,
         message TEXT,
         type TEXT DEFAULT 'mention',
@@ -248,26 +249,27 @@ function parseMentions(content) {
 
 // Create notifications for mentioned agents
 async function createNotifications(message, mentions) {
-  const notifications = mentions
-    .map((agentName) => ({
+  const notifications = mentions.map((mentionedName) => {
+    const agent = findAgentByName(mentionedName);
+    return {
       id: uuidv4(),
-      agent_id: findAgentByName(agentName)?.id,
+      agent_id: agent?.id || null,
+      agent_name: mentionedName,
       room: message.room,
-      message: `${message.agentName} mentioned you: ${message.content.substring(
-        0,
-        100
-      )}...`,
+      message: `${message.agentName} mentioned you: ${message.content.substring(0, 100)}...`,
       type: "mention",
       created_at: new Date().toISOString(),
-    }))
-    .filter((n) => n.agent_id); // Only create notifications for existing agents
-
+    };
+  });
+  // Persist all notifications — even for agents not currently online.
+  // Agents joining later will fetch by name from the server.
   notifications.forEach((notification) => {
     db.run(
-      "INSERT INTO notifications (id, agent_id, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         notification.id,
         notification.agent_id,
+        notification.agent_name,
         notification.room,
         notification.message,
         notification.type,
@@ -275,20 +277,23 @@ async function createNotifications(message, mentions) {
       ]
     );
 
-    // Send real-time notification to agent if connected
-    const agent = agents.get(notification.agent_id);
-    if (agent && agent.socketId) {
-      io.to(agent.socketId).emit("notification", notification);
+    // Also push real-time if agent is currently connected
+    if (notification.agent_id) {
+      const agent = agents.get(notification.agent_id);
+      if (agent && agent.socketId) {
+        io.to(agent.socketId).emit("notification", notification);
+      }
     }
   });
 
   return notifications;
 }
 
-// Find agent by name in current agents
+// Find agent by name — case-insensitive
 function findAgentByName(agentName) {
+  const lower = agentName.toLowerCase();
   for (const agent of agents.values()) {
-    if (agent.name === agentName) {
+    if (agent.name.toLowerCase() === lower) {
       return agent;
     }
   }
@@ -811,10 +816,12 @@ app.get("/api/memory/:agentId", (req, res) => {
 
 app.get("/api/notifications/:agentId", (req, res) => {
   const { agentId } = req.params;
-  const { unreadOnly = false } = req.query;
+  const { unreadOnly = false, agentName } = req.query;
 
-  let query = "SELECT * FROM notifications WHERE agent_id = ?";
-  const params = [agentId];
+  // Match by agent_id OR agent_name (case-insensitive) so offline agents
+  // that were @mentioned can retrieve their notifications after joining.
+  let query = "SELECT * FROM notifications WHERE (agent_id = ? OR LOWER(agent_name) = LOWER(?))";
+  const params = [agentId, agentName || agentId];
 
   if (unreadOnly === "true") {
     query += " AND is_read = 0";
