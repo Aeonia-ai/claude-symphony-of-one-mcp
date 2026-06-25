@@ -281,21 +281,8 @@ server.registerTool(
     }
 
     try {
-      // First try to get from local history (fast path — no network call)
-      if (!params.since && messageHistory.length > 0) {
-        const limit = params.limit || 50;
-        const messages = messageHistory.slice(-limit);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Retrieved ${messages.length} messages from local cache:\n\n${messages.map(m => `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.agentName}: ${m.content}`).join('\n')}`
-            }
-          ]
-        };
-      }
-
-      // Otherwise fetch from server
+      // Always fetch from server — cache fast-path removed to ensure agents
+      // across machines always see authoritative state, not a partial local buffer.
       const response = await transport.getMessages(currentRoom, params.since, params.limit || 50);
 
       const messages = response.data.messages;
