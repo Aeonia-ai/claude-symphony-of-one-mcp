@@ -107,6 +107,12 @@ async function initializeSystem() {
     logger.info(`Created data directory: ${DATA_DIR}`);
   }
 
+  // Schema migrations — run before table creation so columns exist on first boot
+  // and are added to existing DBs that predate this column.
+  await new Promise((resolve) => {
+    db.run("ALTER TABLE notifications ADD COLUMN agent_name TEXT", () => resolve());
+  });
+
   // Initialize database tables — wrapped in a Promise so loadDataFromDatabase
   // only runs after all CREATE TABLE statements have completed.
   await new Promise((resolve, reject) => {
