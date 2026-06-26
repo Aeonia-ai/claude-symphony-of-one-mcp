@@ -349,23 +349,24 @@ server.registerTool(
       };
     }
 
-    let allNotifications = notifications;
-
-    // If local cache is empty, fetch from server — catches @mentions sent
-    // before this agent joined (the most common async coordination case).
-    if (allNotifications.length === 0) {
-      try {
-        const response = await transport.getNotifications(currentAgentId, agentName, params.unreadOnly);
-        const serverNotifs = (response.data?.notifications || []).map(n => ({
-          ...n,
-          read: !!n.is_read,
-          timestamp: n.created_at,
-        }));
-        allNotifications = serverNotifs;
-      } catch (_) {
-        // fall through to local (empty) list
-      }
+    // Always fetch from server and merge with local socket-received notifications.
+    // The local array only contains events received since this session's room_join;
+    // server fetch catches @mentions sent before this agent was online.
+    let serverNotifs = [];
+    try {
+      const response = await transport.getNotifications(currentAgentId, agentName, params.unreadOnly);
+      serverNotifs = (response.data?.notifications || []).map(n => ({
+        ...n,
+        read: !!n.is_read,
+        timestamp: n.created_at,
+      }));
+    } catch (_) {
+      // fall through to local-only
     }
+    // Merge: server results take precedence; deduplicate by id.
+    const seen = new Set(serverNotifs.map(n => n.id));
+    const localOnly = notifications.filter(n => n.id && !seen.has(n.id));
+    const allNotifications = [...serverNotifs, ...localOnly];
 
     let filtered = allNotifications;
 
