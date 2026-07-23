@@ -141,3 +141,151 @@ describe("Bug 10 – write failures surface as failures", () => {
     assert.equal(body.success, false);
   });
 });
+
+describe("Bug 10 – task update routes gate on the write", () => {
+  let srv;
+  let base;
+  const room = "task-update-room";
+  const agentId = randomUUID();
+  let taskId;
+
+  before(async () => {
+    srv = await startServer();
+    base = `http://localhost:${srv.port}`;
+    await fetch(`${base}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId, agentName: "TaskBot", capabilities: {} }),
+    });
+    const created = await (
+      await fetch(`${base}/api/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          roomName: room,
+          title: "updatable",
+          description: "created before the table is dropped",
+          creator: agentId,
+          priority: "low",
+        }),
+      })
+    ).json();
+    taskId = created.task.id;
+  });
+
+  after(async () => {
+    await srv.stop();
+  });
+
+  const dropTasks = () =>
+    new Promise((resolve, reject) => {
+      const db = new sqlite3.Database(srv.dbPath);
+      db.run("DROP TABLE IF EXISTS tasks", (err) =>
+        db.close(() => (err ? reject(err) : resolve()))
+      );
+    });
+
+  it("both update routes succeed while the table exists (control)", async () => {
+    const post = await fetch(`${base}/api/tasks/${taskId}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "in_progress" }),
+    });
+    assert.equal(post.status, 200, "POST update route control");
+
+    const put = await fetch(`${base}/api/tasks/${room}/${taskId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ priority: "high" }),
+    });
+    assert.equal(put.status, 200, "PUT update route control");
+  });
+
+  it("POST /api/tasks/:taskId/update returns 500 on a failed write", async () => {
+    await dropTasks();
+    const res = await fetch(`${base}/api/tasks/${taskId}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "done" }),
+    });
+    assert.equal(
+      res.status,
+      500,
+      "an update that could not be persisted must not report success"
+    );
+  });
+
+  it("PUT /api/tasks/:room/:taskId returns 500 on a failed write", async () => {
+    const res = await fetch(`${base}/api/tasks/${room}/${taskId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "blocked" }),
+    });
+    assert.equal(
+      res.status,
+      500,
+      "the CLI-facing update route must gate on the write too"
+    );
+  });
+});
+
+describe("Bug 10 – side-effect write failures degrade, not fail", () => {
+  let srv;
+  let base;
+  const room = "side-effect-room";
+  const senderId = randomUUID();
+  const targetId = randomUUID();
+
+  before(async () => {
+    srv = await startServer();
+    base = `http://localhost:${srv.port}`;
+    for (const [id, name] of [
+      [senderId, "sender"],
+      [targetId, "target"],
+    ]) {
+      await fetch(`${base}/api/join/${room}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: id, agentName: name, capabilities: {} }),
+      });
+    }
+  });
+
+  after(async () => {
+    await srv.stop();
+  });
+
+  it("a failed notification write does NOT fail the message send", async () => {
+    // Notifications are a side effect of send — there is no caller waiting on
+    // them, so the correct behaviour is to log and carry on rather than fail
+    // a message that was itself persisted successfully.
+    await new Promise((resolve, reject) => {
+      const db = new sqlite3.Database(srv.dbPath);
+      db.run("DROP TABLE IF EXISTS notifications", (err) =>
+        db.close(() => (err ? reject(err) : resolve()))
+      );
+    });
+
+    const res = await fetch(`${base}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: senderId, content: "@target still sent" }),
+    });
+
+    assert.equal(
+      res.status,
+      200,
+      "a message that persisted must still succeed even if its notification row fails"
+    );
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.deepEqual(body.mentions, ["target"]);
+
+    // And the message itself is genuinely in history.
+    const history = await (await fetch(`${base}/api/messages/${room}`)).json();
+    assert.ok(
+      history.messages.map((m) => m.content).includes("@target still sent"),
+      "the message itself must be persisted and served"
+    );
+  });
+});
