@@ -166,9 +166,13 @@ export default class SocketIoHubTransport extends Transport {
    * @param {string} agentName
    * @param {boolean} unreadOnly
    */
-  async getNotifications(agentId, agentName, unreadOnly) {
+  async getNotifications(agentId, agentName, unreadOnly, room) {
     return this._axios.get(`/api/notifications/${agentId}`, {
-      params: { agentName, unreadOnly: unreadOnly ? 'true' : undefined },
+      params: {
+        agentName,
+        unreadOnly: unreadOnly ? 'true' : undefined,
+        room: room || undefined,
+      },
     });
   }
 
@@ -190,12 +194,47 @@ export default class SocketIoHubTransport extends Transport {
   }
 
   /**
-   * POST /api/tasks/:room
+   * POST /api/tasks — the hub takes the room in the BODY as `roomName`.
+   *
+   * This previously posted to /api/tasks/:room, which matches no route on the
+   * hub and 404'd, so create_task never worked over MCP.
    * @param {string} room
    * @param {object} task
    */
   async createTask(room, task) {
-    return this._axios.post(`/api/tasks/${room}`, task);
+    return this._axios.post(`/api/tasks`, { ...task, roomName: room });
+  }
+
+  /**
+   * GET /api/stats — room/agent/task counts and per-room message counts.
+   * Cheap: returns counts only, never message bodies.
+   */
+  async getStats() {
+    return this._axios.get(`/api/stats`);
+  }
+
+  /**
+   * GET /api/rooms — list every room with agent counts.
+   */
+  async getRooms() {
+    return this._axios.get(`/api/rooms`);
+  }
+
+  /**
+   * GET /api/agents/:room — who is currently in a room.
+   * @param {string} room
+   */
+  async getAgents(room) {
+    return this._axios.get(`/api/agents/${room}`);
+  }
+
+  /**
+   * POST /api/notifications/:id/read — mark one notification read.
+   * Without this an agent's unread count can only ever grow.
+   * @param {string} notificationId
+   */
+  async markNotificationRead(notificationId) {
+    return this._axios.post(`/api/notifications/${notificationId}/read`);
   }
 
   /**
@@ -208,12 +247,15 @@ export default class SocketIoHubTransport extends Transport {
   }
 
   /**
-   * PATCH /api/tasks/:taskId (or PUT — matches the server's update route).
+   * POST /api/tasks/:taskId/update
+   *
+   * The hub exposes no PATCH route, so the previous
+   * `patch('/api/tasks/:taskId')` never matched and update_task failed.
    * @param {string} taskId
-   * @param {object} patch
+   * @param {object} patch  { status?, assignee?, priority? }
    */
   async updateTask(taskId, patch) {
-    return this._axios.patch(`/api/tasks/${taskId}`, patch);
+    return this._axios.post(`/api/tasks/${taskId}/update`, patch);
   }
 
   /**

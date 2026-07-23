@@ -83,6 +83,14 @@ const logger = winston.createLogger({
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "claude-symphony-of-one.db");
 const db = new sqlite3.Database(DB_PATH);
 
+// How many recent messages per room to rehydrate into memory on boot.
+// Bounded so a long-lived DB doesn't load unboundedly at startup; older
+// messages remain in SQLite and are simply not served by /api/messages.
+const MESSAGE_HISTORY_LIMIT = parseInt(
+  process.env.MESSAGE_HISTORY_LIMIT || "200",
+  10
+);
+
 // In-memory storage (with database persistence)
 const rooms = new Map();
 const agents = new Map();
@@ -190,6 +198,113 @@ async function initializeSystem() {
   await loadDataFromDatabase();
 }
 
+/**
+ * Fire-and-forget write that at least reports its own failure.
+ *
+ * sqlite3's db.run() swallows errors entirely when given no callback — no
+ * throw, no log — so a failed INSERT was indistinguishable from a successful
+ * one. Use this for writes with no caller waiting on the result (heartbeats,
+ * side-effect rows). Writes whose success is REPORTED to a caller should pass
+ * an explicit callback and gate the response on it instead.
+ *
+ * @param {string} sql
+ * @param {Array} params
+ * @param {string} context  Short label for the log line, e.g. "notification insert"
+ */
+function dbRun(sql, params, context) {
+  db.run(sql, params, function (err) {
+    if (err) {
+      logger.error(`Database write failed (${context}): ${err.message}`);
+    }
+  });
+}
+
+/**
+ * Timestamps double as pagination cursors (`?since=<ts>` with a strict `>`),
+ * so two messages sharing a millisecond are indistinguishable: whichever falls
+ * on a page boundary is skipped forever. Under concurrent load that is common.
+ *
+ * Guarantee a strictly increasing timestamp per room so the cursor is exact.
+ * Skew is at most a few ms and only under bursts.
+ */
+const lastIssuedTs = new Map();
+
+function nextTimestamp(room) {
+  // Reserve SYNCHRONOUSLY from a counter, not from the last element of the
+  // messages array: the array is appended inside the DB write callback, so
+  // concurrent sends would all read the same stale tail and collide anyway.
+  const now = Date.now();
+  const prev = lastIssuedTs.get(room) ?? 0;
+  const ts = prev >= now ? prev + 1 : now;
+  lastIssuedTs.set(room, ts);
+  return new Date(ts).toISOString();
+}
+
+// Tolerate malformed/NULL JSON columns rather than throwing during boot.
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+// Map a `messages` DB row to the in-memory message shape used by
+// /api/messages and the socket 'message' event.
+function rowToMessage(row) {
+  return {
+    id: row.id,
+    type: row.type || "message",
+    agentId: row.agent_id,
+    agentName: row.agent_name,
+    content: row.content,
+    mentions: safeJsonParse(row.mentions, []),
+    metadata: safeJsonParse(row.metadata, {}),
+    timestamp: row.timestamp,
+    room: row.room,
+  };
+}
+
+/**
+ * Rehydrate recent message history from SQLite into the in-memory Map.
+ *
+ * Messages were previously persisted but never read back, so every restart
+ * left /api/messages blind to history that was sitting on disk — and a
+ * `since` query spanning a restart returned a truthful-looking empty result.
+ */
+function loadMessagesForRooms(roomNames) {
+  return Promise.all(
+    roomNames.map(
+      (name) =>
+        new Promise((resolve) => {
+          db.all(
+            "SELECT * FROM messages WHERE room = ? ORDER BY timestamp DESC LIMIT ?",
+            [name, MESSAGE_HISTORY_LIMIT],
+            (err, rows) => {
+              if (err) {
+                logger.error(`Failed to load messages for room ${name}:`, err);
+                return resolve(0); // leave the [] initializer in place
+              }
+              // Rows come back newest-first; stored order is chronological
+              // ascending, which /api/messages' slice(-limit) depends on.
+              const loaded = rows.reverse().map(rowToMessage);
+              messages.set(name, loaded);
+              // Seed the cursor counter so timestamps stay strictly increasing
+              // across a restart, not just within one process lifetime.
+              const newest = loaded.at(-1)?.timestamp;
+              if (newest) {
+                const ms = new Date(newest).getTime();
+                if (Number.isFinite(ms)) lastIssuedTs.set(name, ms);
+              }
+              resolve(rows.length);
+            }
+          );
+        })
+    )
+  );
+}
+
 // Load data from database into memory maps
 async function loadDataFromDatabase() {
   return new Promise((resolve, reject) => {
@@ -234,20 +349,78 @@ async function loadDataFromDatabase() {
           });
         });
         logger.info(`Loaded ${taskRows.length} tasks from database`);
-        resolve();
+
+        // Rehydrate agents. Without this every agent is unknown after a
+        // restart and /api/send answers 404 "Agent not found" until it
+        // happens to re-join — so a deploy silently muted the whole room.
+        // socketId is intentionally null: the old socket is gone, so
+        // real-time pushes are skipped until the agent reconnects, but
+        // REST sends work immediately.
+        db.all("SELECT * FROM agents", (agentErr, agentRows) => {
+          if (agentErr) {
+            logger.error("Failed to load agents from database:", agentErr);
+          } else {
+            agentRows.forEach((row) => {
+              agents.set(row.id, {
+                id: row.id,
+                name: row.name,
+                room: row.room,
+                capabilities: safeJsonParse(row.capabilities, {}),
+                joinedAt: row.joined_at,
+                lastActive: row.last_active,
+                status: row.status || "active",
+                socketId: null,
+              });
+              const room = rooms.get(row.room);
+              if (room) room.agents.add(row.id);
+            });
+            logger.info(`Loaded ${agentRows.length} agents from database`);
+          }
+        });
+
+        // Rehydrate message history so /api/messages survives a restart.
+        loadMessagesForRooms(rows.map((r) => r.name))
+          .then((counts) => {
+            const total = counts.reduce((a, b) => a + b, 0);
+            logger.info(
+              `Loaded ${total} messages from database across ${rows.length} rooms (limit ${MESSAGE_HISTORY_LIMIT}/room)`
+            );
+            resolve();
+          })
+          .catch((msgErr) => {
+            logger.error("Failed to load message history:", msgErr);
+            resolve(); // non-fatal — server still starts
+          });
       });
     });
   });
 }
 
-// Parse mentions from message content (@agentName)
+/**
+ * Parse @mentions from message content.
+ *
+ * Separators (`-`, `.`, `_`) are allowed INSIDE a name but never at the end,
+ * so "@agent.with.dots" resolves fully while "@agent." at the end of a
+ * sentence yields "agent" rather than "agent.". The previous pattern
+ * (/@(\w+(?:-\w+)*)/) stopped at the first dot, silently targeting the wrong
+ * agent.
+ *
+ * Results are deduplicated case-insensitively: mentioning the same agent twice
+ * in one message previously created two notification rows for one event.
+ * The first spelling encountered is preserved.
+ */
 function parseMentions(content) {
-  const mentionRegex = /@(\w+(?:-\w+)*)/g;
+  const mentionRegex = /@([A-Za-z0-9_]+(?:[.\-][A-Za-z0-9_]+)*)/g;
   const mentions = [];
+  const seen = new Set();
   let match;
 
   while ((match = mentionRegex.exec(content)) !== null) {
-    mentions.push(match[1]);
+    const name = match[1];
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    mentions.push(name);
   }
 
   return mentions;
@@ -270,7 +443,7 @@ async function createNotifications(message, mentions) {
   // Persist all notifications — even for agents not currently online.
   // Agents joining later will fetch by name from the server.
   notifications.forEach((notification) => {
-    db.run(
+    dbRun(
       "INSERT INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         notification.id,
@@ -280,7 +453,8 @@ async function createNotifications(message, mentions) {
         notification.message,
         notification.type,
         notification.created_at,
-      ]
+      ],
+      `notification insert for ${notification.agent_name}`
     );
 
     // Also push real-time if agent is currently connected
@@ -378,9 +552,10 @@ function getRoom(roomName) {
     setupFileWatcher(roomName);
 
     // Persist to database
-    db.run(
+    dbRun(
       "INSERT OR REPLACE INTO rooms (id, name, created_at, is_active, settings) VALUES (?, ?, ?, ?, ?)",
-      [uuidv4(), roomName, room.createdAt, 1, JSON.stringify(room.settings)]
+      [uuidv4(), roomName, room.createdAt, 1, JSON.stringify(room.settings)],
+      `room upsert ${roomName}`
     );
 
     logger.info(`Created new room: ${roomName}`);
@@ -410,7 +585,7 @@ app.post("/api/join/:room", (req, res) => {
   agents.set(agentId, agent);
 
   // Persist agent to database
-  db.run(
+  dbRun(
     "INSERT OR REPLACE INTO agents (id, name, room, capabilities, joined_at, last_active, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
     [
       agentId,
@@ -420,7 +595,8 @@ app.post("/api/join/:room", (req, res) => {
       agent.joinedAt,
       agent.lastActive,
       agent.status,
-    ]
+    ],
+    `agent upsert ${agentName}`
   );
 
   const joinMessage = {
@@ -429,7 +605,7 @@ app.post("/api/join/:room", (req, res) => {
     agentId: null,
     agentName: "System",
     content: `${agentName} has joined the room`,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(roomName),
     room: roomName,
     mentions: [],
     metadata: { type: "join" },
@@ -438,7 +614,7 @@ app.post("/api/join/:room", (req, res) => {
   messages.get(roomName).push(joinMessage);
 
   // Persist message to database
-  db.run(
+  dbRun(
     "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
       joinMessage.id,
@@ -450,7 +626,8 @@ app.post("/api/join/:room", (req, res) => {
       JSON.stringify(joinMessage.mentions),
       JSON.stringify(joinMessage.metadata),
       joinMessage.timestamp,
-    ]
+    ],
+    `join message for ${roomName}`
   );
 
   io.to(roomName).emit("message", joinMessage);
@@ -512,13 +689,14 @@ app.post("/api/send", (req, res) => {
     content,
     mentions,
     metadata,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(agent.room),
     room: agent.room,
   };
 
-  messages.get(agent.room).push(message);
-
-  // Persist message to database
+  // Persist BEFORE broadcasting or acknowledging. Previously the emit and the
+  // 200 both happened regardless of the write, so a failed INSERT meant every
+  // other agent saw a message that would not survive a restart, and the sender
+  // was told it succeeded.
   db.run(
     "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
@@ -531,47 +709,125 @@ app.post("/api/send", (req, res) => {
       JSON.stringify(mentions),
       JSON.stringify(metadata),
       message.timestamp,
-    ]
+    ],
+    function (err) {
+      if (err) {
+        logger.error(
+          `Failed to persist message from ${agent.name} in ${agent.room}: ${err.message}`
+        );
+        return res.status(500).json({
+          success: false,
+          error: "Failed to persist message — not delivered",
+        });
+      }
+
+      messages.get(agent.room).push(message);
+
+      // Update agent last active time
+      agent.lastActive = new Date().toISOString();
+      dbRun(
+        "UPDATE agents SET last_active = ? WHERE id = ?",
+        [agent.lastActive, agentId],
+        `last_active heartbeat for ${agent.name}`
+      );
+
+      // Create notifications for mentions
+      if (mentions.length > 0) {
+        createNotifications(message, mentions);
+      }
+
+      io.to(agent.room).emit("message", message);
+
+      logger.info(
+        `Message sent by ${agent.name} in ${agent.room}${
+          mentions.length > 0 ? ` with mentions: ${mentions.join(", ")}` : ""
+        }`
+      );
+
+      res.json({ success: true, messageId: message.id, mentions });
+    }
   );
-
-  // Update agent last active time
-  agent.lastActive = new Date().toISOString();
-  db.run("UPDATE agents SET last_active = ? WHERE id = ?", [
-    agent.lastActive,
-    agentId,
-  ]);
-
-  // Create notifications for mentions
-  if (mentions.length > 0) {
-    createNotifications(message, mentions);
-  }
-
-  io.to(agent.room).emit("message", message);
-
-  logger.info(
-    `Message sent by ${agent.name} in ${agent.room}${
-      mentions.length > 0 ? ` with mentions: ${mentions.join(", ")}` : ""
-    }`
-  );
-
-  res.json({ success: true, messageId: message.id, mentions });
 });
 
 app.get("/api/messages/:room", (req, res) => {
   const { room } = req.params;
   const { since, limit = 100 } = req.query;
 
-  let roomMessages = messages.get(room) || [];
+  // Sort by timestamp before paging. Timestamps are reserved synchronously but
+  // the array is appended inside the DB write callback, so under concurrency
+  // writes land out of order. Paging by array position would then set the
+  // cursor to a message that is not the page maximum, which both re-returns
+  // messages already seen and skips ones that were never returned.
+  // Copy first — never reorder the stored array during a read.
+  let roomMessages = [...(messages.get(room) || [])].sort(
+    (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+  );
 
   if (since) {
     const sinceTime = new Date(since).getTime();
+    // An unparseable `since` yields NaN, and every `> NaN` comparison is false —
+    // which would silently return zero messages instead of erroring. A false
+    // "nothing new" is indistinguishable from a quiet room, so reject it loudly.
+    if (Number.isNaN(sinceTime)) {
+      return res.status(400).json({
+        error: `Invalid 'since' timestamp: ${JSON.stringify(since)}. Expected an ISO 8601 timestamp, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
+    // A date-time with no timezone designator ("2026-07-23T16:10:00") is parsed
+    // in the SERVER's local timezone, not the caller's. Agents polling from a
+    // different timezone would silently get the wrong window, so require an
+    // explicit offset (Z or ±HH:MM) and make the cursor absolute.
+    if (/\d[T ]\d/.test(since) && !/(Z|[+-]\d{2}:?\d{2})$/.test(since.trim())) {
+      return res.status(400).json({
+        error: `Ambiguous 'since' timestamp: ${JSON.stringify(since)} has no timezone offset and would be interpreted in the server's timezone. Append 'Z' for UTC or an explicit offset, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
     roomMessages = roomMessages.filter(
       (m) => new Date(m.timestamp).getTime() > sinceTime
     );
   }
 
+  // `slice(-0)` is `slice(0)` — the WHOLE array — so a limit of 0 would return
+  // everything instead of nothing. Clamp to a non-negative integer and handle
+  // 0 explicitly, so `limit=0` is a usable "count only, send no messages" query.
+  const parsed = parseInt(limit);
+  const max = Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
+  const matched = roomMessages.length;
+
+  // Truncation direction matters.
+  //   - No `since`: the caller wants the most recent N, so take the tail.
+  //   - With `since`: the caller is walking forward through a backlog. Taking
+  //     the tail would return the NEWEST N and skip the oldest unseen ones —
+  //     and because the caller then advances its cursor past them, they would
+  //     never be seen again. Take the head so repeated polls walk the backlog
+  //     contiguously.
+  const page =
+    max === 0
+      ? [] // count-only query
+      : since
+        ? roomMessages.slice(0, max)
+        : roomMessages.slice(-max);
+
+  // On a count-only query, report who the new messages are FROM. Lets an agent
+  // see both its own new-message count and every other participant's without
+  // transferring a single message body.
+  let byAgent;
+  if (max === 0) {
+    byAgent = {};
+    for (const m of roomMessages) {
+      const who = m.agentName || "unknown";
+      byAgent[who] = (byAgent[who] || 0) + 1;
+    }
+  }
+
   res.json({
-    messages: roomMessages.slice(-parseInt(limit)),
+    messages: page,
+    // `matched` is the full size of the window before truncation, so callers
+    // can tell "50 messages" from "50 of 120 messages".
+    matched,
+    returned: page.length,
+    hasMore: page.length < matched,
+    ...(byAgent ? { byAgent } : {}),
   });
 });
 
@@ -627,22 +883,32 @@ app.post("/api/tasks", (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
-  tasks.set(task.id, task);
-
-  // Bug 3 fix: persist task to DB on creation
+  // Bug 3 fix: persist task to DB on creation.
+  // The write gates the in-memory insert, the broadcast and the 200 — a task
+  // reported as created must actually exist on disk.
   db.run(
     "INSERT INTO tasks (id, room, title, description, assignee, creator, priority, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [task.id, task.room, task.title, task.description, task.assignee, task.creator, task.priority, task.status, task.createdAt, task.updatedAt]
+    [task.id, task.room, task.title, task.description, task.assignee, task.creator, task.priority, task.status, task.createdAt, task.updatedAt],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist task ${task.id}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task" });
+      }
+
+      tasks.set(task.id, task);
+
+      io.to(roomName).emit("task", { type: "created", task });
+
+      // Bug 5 fix: also emit task_assigned so mcp-server.js listeners fire
+      if (task.assignee) {
+        io.to(roomName).emit("task_assigned", task);
+      }
+
+      res.json({ success: true, task });
+    }
   );
-
-  io.to(roomName).emit("task", { type: "created", task });
-
-  // Bug 5 fix: also emit task_assigned so mcp-server.js listeners fire
-  if (task.assignee) {
-    io.to(roomName).emit("task_assigned", task);
-  }
-
-  res.json({ success: true, task });
 });
 
 app.get("/api/tasks/:room", (req, res) => {
@@ -674,9 +940,17 @@ app.put("/api/tasks/:room/:taskId", (req, res) => {
   task.updatedAt = new Date().toISOString();
   db.run(
     "UPDATE tasks SET status = ?, assignee = ?, priority = ?, updated_at = ? WHERE id = ?",
-    [task.status, task.assignee, task.priority, task.updatedAt, task.id]
+    [task.status, task.assignee, task.priority, task.updatedAt, task.id],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist update to task ${task.id}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task update" });
+      }
+      res.json({ success: true, task });
+    }
   );
-  res.json({ success: true, task });
 });
 
 // Agent management endpoints
@@ -704,7 +978,7 @@ app.post("/api/broadcast/:room", (req, res) => {
     id: uuidv4(),
     type: "broadcast",
     content: `[${from}] ${content}`,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(roomName),
     room: roomName,
     from,
   };
@@ -729,19 +1003,27 @@ app.post("/api/tasks/:taskId/update", (req, res) => {
   if (priority) task.priority = priority;
   task.updatedAt = new Date().toISOString();
 
-  // Update in database
+  // Update in database — gates the broadcast and the 200.
   db.run(
     "UPDATE tasks SET status = ?, assignee = ?, priority = ?, updated_at = ? WHERE id = ?",
-    [task.status, task.assignee, task.priority, task.updatedAt, taskId]
+    [task.status, task.assignee, task.priority, task.updatedAt, taskId],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist update to task ${taskId}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task update" });
+      }
+
+      io.to(task.room).emit("task", { type: "updated", task });
+
+      logger.info(
+        `Task ${taskId} updated: status=${task.status}, assignee=${task.assignee}`
+      );
+
+      res.json({ success: true, task });
+    }
   );
-
-  io.to(task.room).emit("task", { type: "updated", task });
-
-  logger.info(
-    `Task ${taskId} updated: status=${task.status}, assignee=${task.assignee}`
-  );
-
-  res.json({ success: true, task });
 });
 
 // Agent memory endpoints
@@ -770,7 +1052,7 @@ app.post("/api/memory/:agentId", (req, res) => {
     expiresAt,
   };
 
-  // Store in database
+  // Store in database — gates the 200, since "stored" must mean stored.
   db.run(
     "INSERT INTO agent_memory (id, agent_id, room, key, value, type, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     [
@@ -782,12 +1064,22 @@ app.post("/api/memory/:agentId", (req, res) => {
       type,
       memory.createdAt,
       expiresAt,
-    ]
+    ],
+    function (err) {
+      if (err) {
+        logger.error(
+          `Failed to store memory "${key}" for agent ${agent.name}: ${err.message}`
+        );
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to store memory" });
+      }
+
+      logger.info(`Memory stored for agent ${agent.name}: ${key}`);
+
+      res.json({ success: true, memoryId, memory });
+    }
   );
-
-  logger.info(`Memory stored for agent ${agent.name}: ${key}`);
-
-  res.json({ success: true, memoryId, memory });
 });
 
 app.get("/api/memory/:agentId", (req, res) => {
@@ -822,26 +1114,66 @@ app.get("/api/memory/:agentId", (req, res) => {
 
 app.get("/api/notifications/:agentId", (req, res) => {
   const { agentId } = req.params;
-  const { unreadOnly = false, agentName } = req.query;
+  const { unreadOnly = false, agentName, room } = req.query;
 
   // Match by agent_id OR agent_name (case-insensitive) so offline agents
   // that were @mentioned can retrieve their notifications after joining.
-  let query = "SELECT * FROM notifications WHERE (agent_id = ? OR LOWER(agent_name) = LOWER(?))";
+  //
+  // `room` is optional and opt-in: retrieval is NOT room-scoped by default,
+  // because narrowing it silently would hide mentions an agent was already
+  // relying on. Callers that only care about the room they are working in
+  // pass it explicitly; the room is reported on every notification either way.
+  let match = "(agent_id = ? OR LOWER(agent_name) = LOWER(?))";
   const params = [agentId, agentName || agentId];
+  if (room) {
+    match += " AND room = ?";
+    params.push(room);
+  }
 
+  let query = `SELECT * FROM notifications WHERE ${match}`;
   if (unreadOnly === "true") {
     query += " AND is_read = 0";
   }
 
-  query += " ORDER BY created_at DESC LIMIT 50";
+  // Bounded page, but the caller is told the true totals so it can tell
+  // "50 notifications" from "50 of 120" — and page back with `offset`
+  // instead of older notifications being permanently unreachable.
+  const max = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
+  const offset = parseInt(req.query.offset || "0", 10) || 0;
+  query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
 
-  db.all(query, params, (err, rows) => {
+  db.all(query, [...params, max, offset], (err, rows) => {
     if (err) {
       logger.error("Failed to retrieve notifications:", err);
       return res.status(500).json({ success: false, error: "Database error" });
     }
 
-    res.json({ success: true, notifications: rows });
+    // Real totals, counted in SQL rather than inferred from the page.
+    db.get(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread
+         FROM notifications WHERE ${match}`,
+      params,
+      (countErr, counts) => {
+        if (countErr) {
+          logger.error("Failed to count notifications:", countErr);
+          return res
+            .status(500)
+            .json({ success: false, error: "Database error" });
+        }
+
+        const total = counts?.total || 0;
+        const unread = counts?.unread || 0;
+        res.json({
+          success: true,
+          notifications: rows,
+          returned: rows.length,
+          total,
+          unread,
+          hasMore: offset + rows.length < (unreadOnly === "true" ? unread : total),
+        });
+      }
+    );
   });
 });
 
@@ -890,6 +1222,45 @@ io.on("connection", (socket) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
+
+/**
+ * Graceful shutdown.
+ *
+ * Message/task/notification writes use fire-and-forget `db.run(...)`, so
+ * statements can still be queued in the sqlite3 driver when systemd sends
+ * SIGTERM. Without this, a restart silently drops whatever was in flight —
+ * messages that were acknowledged to the sender with `{success: true}`.
+ * db.close() waits for queued statements to finish before closing.
+ */
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`${signal} received — draining pending database writes`);
+
+  // Stop accepting new work. Socket.IO holds persistent connections, so
+  // httpServer.close() would never fire its callback until every agent
+  // disconnects — the DB flush must NOT be gated behind it.
+  io.close();
+  httpServer.close();
+
+  // This is the part that actually matters for durability: db.close() waits
+  // for queued statements to finish before closing.
+  db.close((err) => {
+    if (err) logger.error("Error closing database:", err);
+    else logger.info("Database closed cleanly");
+    process.exit(0);
+  });
+
+  // Don't hang forever if a socket refuses to close.
+  setTimeout(() => {
+    logger.error("Shutdown timed out — forcing exit");
+    process.exit(1);
+  }, 5000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function startServer() {
   await initializeSystem();
