@@ -356,10 +356,29 @@ server.registerTool(
 
       // Never report a truncated page as if it were the whole window — that is
       // the same silent under-report the `since` filter used to produce.
+      // Count-only: report the total plus a per-sender breakdown, so an agent
+      // can see how much is new from itself and from everyone else in the room
+      // without pulling any message bodies.
+      if (params.limit === 0 && typeof matched === "number") {
+        const byAgent = response.data.byAgent || {};
+        const rows = Object.entries(byAgent)
+          .sort((a, b) => b[1] - a[1])
+          .map(([who, n]) => `  ${who}${who === agentName ? " (you)" : ""}: ${n}`)
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${matched} new message(s) — count only, none fetched` +
+                (rows ? `\n\nBy agent:\n${rows}` : ""),
+            },
+          ],
+        };
+      }
+
       const header =
-        params.limit === 0 && typeof matched === "number"
-          ? `${matched} matching message(s) — count only, none fetched`
-          : hasMore && typeof matched === "number"
+        hasMore && typeof matched === "number"
             ? `Retrieved ${messages.length} of ${matched} matching messages ` +
               `(TRUNCATED — ${matched - messages.length} older ones not shown; ` +
               `poll again with the cursor below to continue, or raise 'limit')`

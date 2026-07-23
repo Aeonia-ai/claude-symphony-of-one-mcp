@@ -427,13 +427,58 @@ describe("MCP end-to-end", () => {
     const text = textOf(res);
     assert.match(
       text,
-      /4 matching message\(s\) — count only, none fetched/,
+      /4 new message\(s\) — count only, none fetched/,
       `limit:0 should report a count and send nothing; got: ${text}`
     );
     assert.ok(
       !/countable-0/.test(text),
       "limit:0 must not transfer message bodies"
     );
+  });
+
+  it("count-only reports new messages per agent, including you", async () => {
+    const all = await client.callTool({ name: "get_messages", arguments: {} });
+    const cursor = textOf(all).match(/Next poll: since=(\S+)/)[1];
+
+    // Two from this agent, three from a peer.
+    for (let i = 0; i < 2; i++) {
+      await client.callTool({
+        name: "send_message",
+        arguments: { content: `mine-${i}` },
+      });
+    }
+    const peerId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: peerId, agentName: "chatty-peer", capabilities: {} }),
+    });
+    for (let i = 0; i < 3; i++) {
+      await fetch(`http://localhost:${srv.port}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: peerId, content: `theirs-${i}` }),
+      });
+    }
+
+    const res = await client.callTool({
+      name: "get_messages",
+      arguments: { since: cursor, limit: 0 },
+    });
+    const text = textOf(res);
+
+    assert.match(text, /By agent:/, `expected a per-agent breakdown; got: ${text}`);
+    assert.match(
+      text,
+      /mcp-test-agent \(you\): 2/,
+      `own count should be labelled and correct; got: ${text}`
+    );
+    assert.match(
+      text,
+      /chatty-peer: 3/,
+      `peer count should be reported; got: ${text}`
+    );
+    assert.ok(!/mine-0|theirs-0/.test(text), "must not transfer bodies");
   });
 
   it("limit: 0 without `since` does not return the whole room", async () => {

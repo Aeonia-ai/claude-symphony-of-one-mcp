@@ -219,6 +219,27 @@ function dbRun(sql, params, context) {
   });
 }
 
+/**
+ * Timestamps double as pagination cursors (`?since=<ts>` with a strict `>`),
+ * so two messages sharing a millisecond are indistinguishable: whichever falls
+ * on a page boundary is skipped forever. Under concurrent load that is common.
+ *
+ * Guarantee a strictly increasing timestamp per room so the cursor is exact.
+ * Skew is at most a few ms and only under bursts.
+ */
+const lastIssuedTs = new Map();
+
+function nextTimestamp(room) {
+  // Reserve SYNCHRONOUSLY from a counter, not from the last element of the
+  // messages array: the array is appended inside the DB write callback, so
+  // concurrent sends would all read the same stale tail and collide anyway.
+  const now = Date.now();
+  const prev = lastIssuedTs.get(room) ?? 0;
+  const ts = prev >= now ? prev + 1 : now;
+  lastIssuedTs.set(room, ts);
+  return new Date(ts).toISOString();
+}
+
 // Tolerate malformed/NULL JSON columns rather than throwing during boot.
 function safeJsonParse(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -267,7 +288,15 @@ function loadMessagesForRooms(roomNames) {
               }
               // Rows come back newest-first; stored order is chronological
               // ascending, which /api/messages' slice(-limit) depends on.
-              messages.set(name, rows.reverse().map(rowToMessage));
+              const loaded = rows.reverse().map(rowToMessage);
+              messages.set(name, loaded);
+              // Seed the cursor counter so timestamps stay strictly increasing
+              // across a restart, not just within one process lifetime.
+              const newest = loaded.at(-1)?.timestamp;
+              if (newest) {
+                const ms = new Date(newest).getTime();
+                if (Number.isFinite(ms)) lastIssuedTs.set(name, ms);
+              }
               resolve(rows.length);
             }
           );
@@ -320,6 +349,34 @@ async function loadDataFromDatabase() {
           });
         });
         logger.info(`Loaded ${taskRows.length} tasks from database`);
+
+        // Rehydrate agents. Without this every agent is unknown after a
+        // restart and /api/send answers 404 "Agent not found" until it
+        // happens to re-join — so a deploy silently muted the whole room.
+        // socketId is intentionally null: the old socket is gone, so
+        // real-time pushes are skipped until the agent reconnects, but
+        // REST sends work immediately.
+        db.all("SELECT * FROM agents", (agentErr, agentRows) => {
+          if (agentErr) {
+            logger.error("Failed to load agents from database:", agentErr);
+          } else {
+            agentRows.forEach((row) => {
+              agents.set(row.id, {
+                id: row.id,
+                name: row.name,
+                room: row.room,
+                capabilities: safeJsonParse(row.capabilities, {}),
+                joinedAt: row.joined_at,
+                lastActive: row.last_active,
+                status: row.status || "active",
+                socketId: null,
+              });
+              const room = rooms.get(row.room);
+              if (room) room.agents.add(row.id);
+            });
+            logger.info(`Loaded ${agentRows.length} agents from database`);
+          }
+        });
 
         // Rehydrate message history so /api/messages survives a restart.
         loadMessagesForRooms(rows.map((r) => r.name))
@@ -548,7 +605,7 @@ app.post("/api/join/:room", (req, res) => {
     agentId: null,
     agentName: "System",
     content: `${agentName} has joined the room`,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(roomName),
     room: roomName,
     mentions: [],
     metadata: { type: "join" },
@@ -632,7 +689,7 @@ app.post("/api/send", (req, res) => {
     content,
     mentions,
     metadata,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(agent.room),
     room: agent.room,
   };
 
@@ -696,7 +753,15 @@ app.get("/api/messages/:room", (req, res) => {
   const { room } = req.params;
   const { since, limit = 100 } = req.query;
 
-  let roomMessages = messages.get(room) || [];
+  // Sort by timestamp before paging. Timestamps are reserved synchronously but
+  // the array is appended inside the DB write callback, so under concurrency
+  // writes land out of order. Paging by array position would then set the
+  // cursor to a message that is not the page maximum, which both re-returns
+  // messages already seen and skips ones that were never returned.
+  // Copy first — never reorder the stored array during a read.
+  let roomMessages = [...(messages.get(room) || [])].sort(
+    (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+  );
 
   if (since) {
     const sinceTime = new Date(since).getTime();
@@ -743,6 +808,18 @@ app.get("/api/messages/:room", (req, res) => {
         ? roomMessages.slice(0, max)
         : roomMessages.slice(-max);
 
+  // On a count-only query, report who the new messages are FROM. Lets an agent
+  // see both its own new-message count and every other participant's without
+  // transferring a single message body.
+  let byAgent;
+  if (max === 0) {
+    byAgent = {};
+    for (const m of roomMessages) {
+      const who = m.agentName || "unknown";
+      byAgent[who] = (byAgent[who] || 0) + 1;
+    }
+  }
+
   res.json({
     messages: page,
     // `matched` is the full size of the window before truncation, so callers
@@ -750,6 +827,7 @@ app.get("/api/messages/:room", (req, res) => {
     matched,
     returned: page.length,
     hasMore: page.length < matched,
+    ...(byAgent ? { byAgent } : {}),
   });
 });
 
@@ -900,7 +978,7 @@ app.post("/api/broadcast/:room", (req, res) => {
     id: uuidv4(),
     type: "broadcast",
     content: `[${from}] ${content}`,
-    timestamp: new Date().toISOString(),
+    timestamp: nextTimestamp(roomName),
     room: roomName,
     from,
   };
