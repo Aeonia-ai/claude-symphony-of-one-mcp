@@ -198,6 +198,27 @@ async function initializeSystem() {
   await loadDataFromDatabase();
 }
 
+/**
+ * Fire-and-forget write that at least reports its own failure.
+ *
+ * sqlite3's db.run() swallows errors entirely when given no callback — no
+ * throw, no log — so a failed INSERT was indistinguishable from a successful
+ * one. Use this for writes with no caller waiting on the result (heartbeats,
+ * side-effect rows). Writes whose success is REPORTED to a caller should pass
+ * an explicit callback and gate the response on it instead.
+ *
+ * @param {string} sql
+ * @param {Array} params
+ * @param {string} context  Short label for the log line, e.g. "notification insert"
+ */
+function dbRun(sql, params, context) {
+  db.run(sql, params, function (err) {
+    if (err) {
+      logger.error(`Database write failed (${context}): ${err.message}`);
+    }
+  });
+}
+
 // Tolerate malformed/NULL JSON columns rather than throwing during boot.
 function safeJsonParse(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -348,7 +369,7 @@ async function createNotifications(message, mentions) {
   // Persist all notifications — even for agents not currently online.
   // Agents joining later will fetch by name from the server.
   notifications.forEach((notification) => {
-    db.run(
+    dbRun(
       "INSERT INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         notification.id,
@@ -358,7 +379,8 @@ async function createNotifications(message, mentions) {
         notification.message,
         notification.type,
         notification.created_at,
-      ]
+      ],
+      `notification insert for ${notification.agent_name}`
     );
 
     // Also push real-time if agent is currently connected
@@ -456,9 +478,10 @@ function getRoom(roomName) {
     setupFileWatcher(roomName);
 
     // Persist to database
-    db.run(
+    dbRun(
       "INSERT OR REPLACE INTO rooms (id, name, created_at, is_active, settings) VALUES (?, ?, ?, ?, ?)",
-      [uuidv4(), roomName, room.createdAt, 1, JSON.stringify(room.settings)]
+      [uuidv4(), roomName, room.createdAt, 1, JSON.stringify(room.settings)],
+      `room upsert ${roomName}`
     );
 
     logger.info(`Created new room: ${roomName}`);
@@ -488,7 +511,7 @@ app.post("/api/join/:room", (req, res) => {
   agents.set(agentId, agent);
 
   // Persist agent to database
-  db.run(
+  dbRun(
     "INSERT OR REPLACE INTO agents (id, name, room, capabilities, joined_at, last_active, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
     [
       agentId,
@@ -498,7 +521,8 @@ app.post("/api/join/:room", (req, res) => {
       agent.joinedAt,
       agent.lastActive,
       agent.status,
-    ]
+    ],
+    `agent upsert ${agentName}`
   );
 
   const joinMessage = {
@@ -516,7 +540,7 @@ app.post("/api/join/:room", (req, res) => {
   messages.get(roomName).push(joinMessage);
 
   // Persist message to database
-  db.run(
+  dbRun(
     "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
       joinMessage.id,
@@ -528,7 +552,8 @@ app.post("/api/join/:room", (req, res) => {
       JSON.stringify(joinMessage.mentions),
       JSON.stringify(joinMessage.metadata),
       joinMessage.timestamp,
-    ]
+    ],
+    `join message for ${roomName}`
   );
 
   io.to(roomName).emit("message", joinMessage);
@@ -594,9 +619,10 @@ app.post("/api/send", (req, res) => {
     room: agent.room,
   };
 
-  messages.get(agent.room).push(message);
-
-  // Persist message to database
+  // Persist BEFORE broadcasting or acknowledging. Previously the emit and the
+  // 200 both happened regardless of the write, so a failed INSERT meant every
+  // other agent saw a message that would not survive a restart, and the sender
+  // was told it succeeded.
   db.run(
     "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
@@ -609,30 +635,44 @@ app.post("/api/send", (req, res) => {
       JSON.stringify(mentions),
       JSON.stringify(metadata),
       message.timestamp,
-    ]
+    ],
+    function (err) {
+      if (err) {
+        logger.error(
+          `Failed to persist message from ${agent.name} in ${agent.room}: ${err.message}`
+        );
+        return res.status(500).json({
+          success: false,
+          error: "Failed to persist message — not delivered",
+        });
+      }
+
+      messages.get(agent.room).push(message);
+
+      // Update agent last active time
+      agent.lastActive = new Date().toISOString();
+      dbRun(
+        "UPDATE agents SET last_active = ? WHERE id = ?",
+        [agent.lastActive, agentId],
+        `last_active heartbeat for ${agent.name}`
+      );
+
+      // Create notifications for mentions
+      if (mentions.length > 0) {
+        createNotifications(message, mentions);
+      }
+
+      io.to(agent.room).emit("message", message);
+
+      logger.info(
+        `Message sent by ${agent.name} in ${agent.room}${
+          mentions.length > 0 ? ` with mentions: ${mentions.join(", ")}` : ""
+        }`
+      );
+
+      res.json({ success: true, messageId: message.id, mentions });
+    }
   );
-
-  // Update agent last active time
-  agent.lastActive = new Date().toISOString();
-  db.run("UPDATE agents SET last_active = ? WHERE id = ?", [
-    agent.lastActive,
-    agentId,
-  ]);
-
-  // Create notifications for mentions
-  if (mentions.length > 0) {
-    createNotifications(message, mentions);
-  }
-
-  io.to(agent.room).emit("message", message);
-
-  logger.info(
-    `Message sent by ${agent.name} in ${agent.room}${
-      mentions.length > 0 ? ` with mentions: ${mentions.join(", ")}` : ""
-    }`
-  );
-
-  res.json({ success: true, messageId: message.id, mentions });
 });
 
 app.get("/api/messages/:room", (req, res) => {
@@ -739,22 +779,32 @@ app.post("/api/tasks", (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
-  tasks.set(task.id, task);
-
-  // Bug 3 fix: persist task to DB on creation
+  // Bug 3 fix: persist task to DB on creation.
+  // The write gates the in-memory insert, the broadcast and the 200 — a task
+  // reported as created must actually exist on disk.
   db.run(
     "INSERT INTO tasks (id, room, title, description, assignee, creator, priority, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [task.id, task.room, task.title, task.description, task.assignee, task.creator, task.priority, task.status, task.createdAt, task.updatedAt]
+    [task.id, task.room, task.title, task.description, task.assignee, task.creator, task.priority, task.status, task.createdAt, task.updatedAt],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist task ${task.id}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task" });
+      }
+
+      tasks.set(task.id, task);
+
+      io.to(roomName).emit("task", { type: "created", task });
+
+      // Bug 5 fix: also emit task_assigned so mcp-server.js listeners fire
+      if (task.assignee) {
+        io.to(roomName).emit("task_assigned", task);
+      }
+
+      res.json({ success: true, task });
+    }
   );
-
-  io.to(roomName).emit("task", { type: "created", task });
-
-  // Bug 5 fix: also emit task_assigned so mcp-server.js listeners fire
-  if (task.assignee) {
-    io.to(roomName).emit("task_assigned", task);
-  }
-
-  res.json({ success: true, task });
 });
 
 app.get("/api/tasks/:room", (req, res) => {
@@ -786,9 +836,17 @@ app.put("/api/tasks/:room/:taskId", (req, res) => {
   task.updatedAt = new Date().toISOString();
   db.run(
     "UPDATE tasks SET status = ?, assignee = ?, priority = ?, updated_at = ? WHERE id = ?",
-    [task.status, task.assignee, task.priority, task.updatedAt, task.id]
+    [task.status, task.assignee, task.priority, task.updatedAt, task.id],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist update to task ${task.id}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task update" });
+      }
+      res.json({ success: true, task });
+    }
   );
-  res.json({ success: true, task });
 });
 
 // Agent management endpoints
@@ -841,19 +899,27 @@ app.post("/api/tasks/:taskId/update", (req, res) => {
   if (priority) task.priority = priority;
   task.updatedAt = new Date().toISOString();
 
-  // Update in database
+  // Update in database — gates the broadcast and the 200.
   db.run(
     "UPDATE tasks SET status = ?, assignee = ?, priority = ?, updated_at = ? WHERE id = ?",
-    [task.status, task.assignee, task.priority, task.updatedAt, taskId]
+    [task.status, task.assignee, task.priority, task.updatedAt, taskId],
+    function (err) {
+      if (err) {
+        logger.error(`Failed to persist update to task ${taskId}: ${err.message}`);
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to persist task update" });
+      }
+
+      io.to(task.room).emit("task", { type: "updated", task });
+
+      logger.info(
+        `Task ${taskId} updated: status=${task.status}, assignee=${task.assignee}`
+      );
+
+      res.json({ success: true, task });
+    }
   );
-
-  io.to(task.room).emit("task", { type: "updated", task });
-
-  logger.info(
-    `Task ${taskId} updated: status=${task.status}, assignee=${task.assignee}`
-  );
-
-  res.json({ success: true, task });
 });
 
 // Agent memory endpoints
@@ -882,7 +948,7 @@ app.post("/api/memory/:agentId", (req, res) => {
     expiresAt,
   };
 
-  // Store in database
+  // Store in database — gates the 200, since "stored" must mean stored.
   db.run(
     "INSERT INTO agent_memory (id, agent_id, room, key, value, type, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     [
@@ -894,12 +960,22 @@ app.post("/api/memory/:agentId", (req, res) => {
       type,
       memory.createdAt,
       expiresAt,
-    ]
+    ],
+    function (err) {
+      if (err) {
+        logger.error(
+          `Failed to store memory "${key}" for agent ${agent.name}: ${err.message}`
+        );
+        return res
+          .status(500)
+          .json({ success: false, error: "Failed to store memory" });
+      }
+
+      logger.info(`Memory stored for agent ${agent.name}: ${key}`);
+
+      res.json({ success: true, memoryId, memory });
+    }
   );
-
-  logger.info(`Memory stored for agent ${agent.name}: ${key}`);
-
-  res.json({ success: true, memoryId, memory });
 });
 
 app.get("/api/memory/:agentId", (req, res) => {
