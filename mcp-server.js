@@ -254,13 +254,22 @@ server.registerTool(
     }
 
     try {
-      await transport.sendMessage(params.content, params.metadata || {});
+      const sent = await transport.sendMessage(params.content, params.metadata || {});
+
+      // Echo the mentions the SERVER actually parsed. Mention parsing has its
+      // own rules (dots, hyphens, dedupe), so an agent that assumes its @name
+      // resolved could be wrong with no way to tell.
+      const mentions = sent?.data?.mentions;
+      const mentionNote =
+        Array.isArray(mentions) && mentions.length
+          ? ` — notified: ${mentions.join(", ")}`
+          : "";
 
       return {
         content: [
           {
             type: "text",
-            text: `Message sent to room "${currentRoom}"`
+            text: `Message sent to room "${currentRoom}"${mentionNote}`
           }
         ]
       };
@@ -369,6 +378,11 @@ server.registerTool(
     inputSchema: {
       unreadOnly: z.boolean().optional().describe("Only return unread notifications"),
       type: z.enum(["mention", "keyword", "task", "system"]).optional().describe("Filter by notification type"),
+      currentRoomOnly: z.boolean().optional().describe(
+        "Only return notifications from the room you are currently in. " +
+        "Default false — mentions from other rooms are included, and every " +
+        "notification is labelled with its room."
+      ),
     },
   },
   async (params) => {
@@ -391,7 +405,12 @@ server.registerTool(
     let serverCounts = null;
     if (transport) {
       try {
-        const response = await transport.getNotifications(currentAgentId, agentName, params.unreadOnly);
+        const response = await transport.getNotifications(
+          currentAgentId,
+          agentName,
+          params.unreadOnly,
+          params.currentRoomOnly ? currentRoom : undefined
+        );
         serverNotifs = (response.data?.notifications || []).map(n => ({
           ...n,
           read: !!n.is_read,
@@ -409,8 +428,13 @@ server.registerTool(
       }
     }
     // Merge: server results take precedence; deduplicate by id.
+    // The room filter must be applied to the LOCAL buffer too — the server
+    // query honours it, but socket-received notifications bypass the server
+    // entirely and would otherwise defeat the filter on their way back in.
     const seen = new Set(serverNotifs.map(n => n.id));
-    const localOnly = notifications.filter(n => n.id && !seen.has(n.id));
+    const localOnly = notifications
+      .filter(n => n.id && !seen.has(n.id))
+      .filter(n => !params.currentRoomOnly || n.room === currentRoom);
     const allNotifications = [...serverNotifs, ...localOnly];
 
     let filtered = allNotifications;
@@ -430,9 +454,13 @@ server.registerTool(
         ? serverCounts.unread
         : allNotifications.filter((n) => !n.read).length;
 
-    const notificationList = filtered.map(n =>
-      `[${n.type.toUpperCase()}] ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`
-    ).join('\n');
+    // Label the source room: retrieval is not room-scoped by default, so an
+    // unlabelled list made a mention from another room look like it came from
+    // the one the agent is working in.
+    const notificationList = filtered.map(n => {
+      const where = n.room && n.room !== currentRoom ? ` {room: ${n.room}}` : '';
+      return `[${n.type.toUpperCase()}]${where} ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`;
+    }).join('\n');
 
     const truncated = serverCounts?.hasMore
       ? ` — TRUNCATED, use offset to page back`

@@ -339,14 +339,31 @@ async function loadDataFromDatabase() {
   });
 }
 
-// Parse mentions from message content (@agentName)
+/**
+ * Parse @mentions from message content.
+ *
+ * Separators (`-`, `.`, `_`) are allowed INSIDE a name but never at the end,
+ * so "@agent.with.dots" resolves fully while "@agent." at the end of a
+ * sentence yields "agent" rather than "agent.". The previous pattern
+ * (/@(\w+(?:-\w+)*)/) stopped at the first dot, silently targeting the wrong
+ * agent.
+ *
+ * Results are deduplicated case-insensitively: mentioning the same agent twice
+ * in one message previously created two notification rows for one event.
+ * The first spelling encountered is preserved.
+ */
 function parseMentions(content) {
-  const mentionRegex = /@(\w+(?:-\w+)*)/g;
+  const mentionRegex = /@([A-Za-z0-9_]+(?:[.\-][A-Za-z0-9_]+)*)/g;
   const mentions = [];
+  const seen = new Set();
   let match;
 
   while ((match = mentionRegex.exec(content)) !== null) {
-    mentions.push(match[1]);
+    const name = match[1];
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    mentions.push(name);
   }
 
   return mentions;
@@ -1010,12 +1027,21 @@ app.get("/api/memory/:agentId", (req, res) => {
 
 app.get("/api/notifications/:agentId", (req, res) => {
   const { agentId } = req.params;
-  const { unreadOnly = false, agentName } = req.query;
+  const { unreadOnly = false, agentName, room } = req.query;
 
   // Match by agent_id OR agent_name (case-insensitive) so offline agents
   // that were @mentioned can retrieve their notifications after joining.
-  const match = "(agent_id = ? OR LOWER(agent_name) = LOWER(?))";
+  //
+  // `room` is optional and opt-in: retrieval is NOT room-scoped by default,
+  // because narrowing it silently would hide mentions an agent was already
+  // relying on. Callers that only care about the room they are working in
+  // pass it explicitly; the room is reported on every notification either way.
+  let match = "(agent_id = ? OR LOWER(agent_name) = LOWER(?))";
   const params = [agentId, agentName || agentId];
+  if (room) {
+    match += " AND room = ?";
+    params.push(room);
+  }
 
   let query = `SELECT * FROM notifications WHERE ${match}`;
   if (unreadOnly === "true") {

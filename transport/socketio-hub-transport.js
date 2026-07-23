@@ -166,9 +166,13 @@ export default class SocketIoHubTransport extends Transport {
    * @param {string} agentName
    * @param {boolean} unreadOnly
    */
-  async getNotifications(agentId, agentName, unreadOnly) {
+  async getNotifications(agentId, agentName, unreadOnly, room) {
     return this._axios.get(`/api/notifications/${agentId}`, {
-      params: { agentName, unreadOnly: unreadOnly ? 'true' : undefined },
+      params: {
+        agentName,
+        unreadOnly: unreadOnly ? 'true' : undefined,
+        room: room || undefined,
+      },
     });
   }
 

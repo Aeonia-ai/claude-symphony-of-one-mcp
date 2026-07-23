@@ -278,6 +278,118 @@ describe("MCP end-to-end", () => {
     );
   });
 
+  it("send_message reports deduplicated mentions", async () => {
+    const res = await client.callTool({
+      name: "send_message",
+      arguments: { content: "@dupe-agent once and @dupe-agent twice" },
+    });
+    const text = textOf(res);
+    assert.ok(!res.isError, `send_message errored: ${text}`);
+    // The tool echoes the mentions it parsed; one agent mentioned twice in a
+    // single message is still one mention.
+    const occurrences = (text.match(/dupe-agent/g) || []).length;
+    assert.equal(
+      occurrences,
+      1,
+      `mentions should be deduplicated in the MCP response, got ${occurrences} in: ${text}`
+    );
+  });
+
+  it("send_message resolves dotted agent names in full", async () => {
+    const res = await client.callTool({
+      name: "send_message",
+      arguments: { content: "@dotted.agent.name please review" },
+    });
+    const text = textOf(res);
+    assert.ok(!res.isError, `send_message errored: ${text}`);
+    assert.match(
+      text,
+      /dotted\.agent\.name/,
+      `a dotted name must not be truncated at the first dot; got: ${text}`
+    );
+  });
+
+  it("get_notifications labels mentions from other rooms", async () => {
+    // Mention this agent from a DIFFERENT room than the one it is in.
+    const otherRoom = `other-${randomUUID().slice(0, 6)}`;
+    const outsiderId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${otherRoom}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: outsiderId,
+        agentName: "outsider",
+        capabilities: {},
+      }),
+    });
+    await fetch(`http://localhost:${srv.port}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: outsiderId,
+        content: "@mcp-test-agent ping from elsewhere",
+      }),
+    });
+
+    const res = await client.callTool({
+      name: "get_notifications",
+      arguments: {},
+    });
+    const text = textOf(res);
+    assert.ok(!res.isError, `get_notifications errored: ${text}`);
+    assert.match(
+      text,
+      new RegExp(`\\{room: ${otherRoom}\\}`),
+      `a mention from another room must be labelled with its room; got: ${text}`
+    );
+  });
+
+  it("get_notifications can narrow to the current room", async () => {
+    const scoped = await client.callTool({
+      name: "get_notifications",
+      arguments: { currentRoomOnly: true },
+    });
+    const text = textOf(scoped);
+    assert.ok(!scoped.isError, `get_notifications errored: ${text}`);
+    // Nothing from another room should survive the filter, so no {room: ...}
+    // label (which is only emitted for notifications outside currentRoom).
+    assert.ok(
+      !/\{room: /.test(text),
+      `currentRoomOnly must exclude other rooms; got: ${text}`
+    );
+  });
+
+  it("delivers messages from another agent in real time over the socket", async () => {
+    // The socket path (onMessage) is how an MCP client learns about traffic
+    // between polls; everything else here goes over REST.
+    const marker = `realtime-${randomUUID().slice(0, 6)}`;
+    const otherId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agentId: otherId,
+        agentName: "realtime-peer",
+        capabilities: {},
+      }),
+    });
+    await fetch(`http://localhost:${srv.port}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: otherId, content: marker }),
+    });
+
+    // Give the socket event time to arrive at the MCP server process.
+    await new Promise((r) => setTimeout(r, 500));
+
+    const res = await client.callTool({ name: "get_messages", arguments: {} });
+    assert.match(
+      textOf(res),
+      new RegExp(marker),
+      "a message from another agent must be visible to this MCP client"
+    );
+  });
+
   it("tools report a clean error when not in a room", async () => {
     await client.callTool({ name: "room_leave", arguments: {} });
     const res = await client.callTool({ name: "get_messages", arguments: {} });
