@@ -26,6 +26,23 @@ let notifications = [];
 let messageHistory = [];
 let watchPatterns = [];
 
+/**
+ * Emit a copy-pasteable `since` cursor for the next poll.
+ *
+ * Message timestamps are stored as UTC ISO strings (`...Z`), so the cursor is
+ * absolute and unambiguous regardless of the calling agent's timezone. Rendered
+ * message lines use local time for readability, which is NOT valid `since`
+ * input — this cursor is what agents should feed back.
+ */
+function formatCursor(messages) {
+  if (!messages.length) return "";
+  const newest = messages.reduce(
+    (a, m) => (new Date(m.timestamp) > new Date(a.timestamp) ? m : a)
+  );
+  const iso = new Date(newest.timestamp).toISOString();
+  return `\n\nNext poll: since=${iso}`;
+}
+
 // Ensure shared directory exists
 async function ensureSharedDir() {
   try {
@@ -267,7 +284,11 @@ server.registerTool(
     title: "Get Messages",
     description: "Get recent messages from current room",
     inputSchema: {
-      since: z.string().optional().describe("ISO timestamp to get messages after"),
+      since: z.string().optional().describe(
+        "Full ISO 8601 timestamp to get messages after, e.g. 2026-07-23T21:00:00.000Z. " +
+        "Must be a complete date+time — a clock time alone ('4:10 PM') is rejected. " +
+        "Use the 'next poll' cursor printed at the end of this tool's output."
+      ),
       limit: z.number().optional().describe("Maximum number of messages (default: 50)"),
     },
   },
@@ -304,20 +325,34 @@ server.registerTool(
       const response = await transport.getMessages(currentRoom, params.since, params.limit || 50);
 
       const messages = response.data.messages;
+      const { matched, hasMore } = response.data;
+
+      // Never report a truncated page as if it were the whole window — that is
+      // the same silent under-report the `since` filter used to produce.
+      const header =
+        hasMore && typeof matched === "number"
+          ? `Retrieved ${messages.length} of ${matched} matching messages ` +
+            `(TRUNCATED — ${matched - messages.length} older ones not shown; ` +
+            `poll again with the cursor below to continue, or raise 'limit')`
+          : `Retrieved ${messages.length} messages from server`;
+
       return {
         content: [
           {
             type: "text",
-            text: `Retrieved ${messages.length} messages from server:\n\n${messages.map(m => `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.agentName}: ${m.content}`).join('\n')}`
+            text: `${header}:\n\n${messages.map(m => `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.agentName}: ${m.content}`).join('\n')}${formatCursor(messages)}`
           }
         ]
       };
     } catch (error) {
+      // Surface the server's explanation (e.g. an invalid `since`) rather than
+      // just "Request failed with status code 400".
+      const detail = error.response?.data?.error;
       return {
         content: [
           {
             type: "text",
-            text: `Failed to get messages: ${error.message}`
+            text: `Failed to get messages: ${detail || error.message}`
           }
         ],
         isError: true
@@ -353,15 +388,22 @@ server.registerTool(
     // The local array only contains events received since this session's room_join;
     // server fetch catches @mentions sent before this agent was online.
     let serverNotifs = [];
+    let serverCounts = null;
     if (transport) {
       try {
         const response = await transport.getNotifications(currentAgentId, agentName, params.unreadOnly);
-        console.error('[get_notifications] server response:', JSON.stringify(response.data));
         serverNotifs = (response.data?.notifications || []).map(n => ({
           ...n,
           read: !!n.is_read,
           timestamp: n.created_at,
         }));
+        // Authoritative totals from the server; the returned page may be
+        // smaller than the true unread count.
+        serverCounts = {
+          total: response.data?.total,
+          unread: response.data?.unread,
+          hasMore: response.data?.hasMore,
+        };
       } catch (err) {
         console.error('[get_notifications] server fetch failed:', err.message);
       }
@@ -381,16 +423,26 @@ server.registerTool(
       filtered = filtered.filter((n) => n.type === params.type);
     }
 
-    const unreadCount = allNotifications.filter((n) => !n.read).length;
+    // Prefer the server's SQL-counted total; fall back to counting the page
+    // only when the server didn't report one (older hub, or fetch failed).
+    const unreadCount =
+      typeof serverCounts?.unread === "number"
+        ? serverCounts.unread
+        : allNotifications.filter((n) => !n.read).length;
+
     const notificationList = filtered.map(n =>
       `[${n.type.toUpperCase()}] ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`
     ).join('\n');
+
+    const truncated = serverCounts?.hasMore
+      ? ` — TRUNCATED, use offset to page back`
+      : "";
 
     return {
       content: [
         {
           type: "text",
-          text: `Notifications (${filtered.length} shown, ${unreadCount} unread total):\n\n${notificationList || 'No notifications'}`
+          text: `Notifications (${filtered.length} shown, ${unreadCount} unread total${truncated}):\n\n${notificationList || 'No notifications'}`
         }
       ]
     };

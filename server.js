@@ -83,6 +83,14 @@ const logger = winston.createLogger({
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "claude-symphony-of-one.db");
 const db = new sqlite3.Database(DB_PATH);
 
+// How many recent messages per room to rehydrate into memory on boot.
+// Bounded so a long-lived DB doesn't load unboundedly at startup; older
+// messages remain in SQLite and are simply not served by /api/messages.
+const MESSAGE_HISTORY_LIMIT = parseInt(
+  process.env.MESSAGE_HISTORY_LIMIT || "200",
+  10
+);
+
 // In-memory storage (with database persistence)
 const rooms = new Map();
 const agents = new Map();
@@ -190,6 +198,63 @@ async function initializeSystem() {
   await loadDataFromDatabase();
 }
 
+// Tolerate malformed/NULL JSON columns rather than throwing during boot.
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+// Map a `messages` DB row to the in-memory message shape used by
+// /api/messages and the socket 'message' event.
+function rowToMessage(row) {
+  return {
+    id: row.id,
+    type: row.type || "message",
+    agentId: row.agent_id,
+    agentName: row.agent_name,
+    content: row.content,
+    mentions: safeJsonParse(row.mentions, []),
+    metadata: safeJsonParse(row.metadata, {}),
+    timestamp: row.timestamp,
+    room: row.room,
+  };
+}
+
+/**
+ * Rehydrate recent message history from SQLite into the in-memory Map.
+ *
+ * Messages were previously persisted but never read back, so every restart
+ * left /api/messages blind to history that was sitting on disk — and a
+ * `since` query spanning a restart returned a truthful-looking empty result.
+ */
+function loadMessagesForRooms(roomNames) {
+  return Promise.all(
+    roomNames.map(
+      (name) =>
+        new Promise((resolve) => {
+          db.all(
+            "SELECT * FROM messages WHERE room = ? ORDER BY timestamp DESC LIMIT ?",
+            [name, MESSAGE_HISTORY_LIMIT],
+            (err, rows) => {
+              if (err) {
+                logger.error(`Failed to load messages for room ${name}:`, err);
+                return resolve(0); // leave the [] initializer in place
+              }
+              // Rows come back newest-first; stored order is chronological
+              // ascending, which /api/messages' slice(-limit) depends on.
+              messages.set(name, rows.reverse().map(rowToMessage));
+              resolve(rows.length);
+            }
+          );
+        })
+    )
+  );
+}
+
 // Load data from database into memory maps
 async function loadDataFromDatabase() {
   return new Promise((resolve, reject) => {
@@ -234,7 +299,20 @@ async function loadDataFromDatabase() {
           });
         });
         logger.info(`Loaded ${taskRows.length} tasks from database`);
-        resolve();
+
+        // Rehydrate message history so /api/messages survives a restart.
+        loadMessagesForRooms(rows.map((r) => r.name))
+          .then((counts) => {
+            const total = counts.reduce((a, b) => a + b, 0);
+            logger.info(
+              `Loaded ${total} messages from database across ${rows.length} rooms (limit ${MESSAGE_HISTORY_LIMIT}/room)`
+            );
+            resolve();
+          })
+          .catch((msgErr) => {
+            logger.error("Failed to load message history:", msgErr);
+            resolve(); // non-fatal — server still starts
+          });
       });
     });
   });
@@ -565,13 +643,47 @@ app.get("/api/messages/:room", (req, res) => {
 
   if (since) {
     const sinceTime = new Date(since).getTime();
+    // An unparseable `since` yields NaN, and every `> NaN` comparison is false —
+    // which would silently return zero messages instead of erroring. A false
+    // "nothing new" is indistinguishable from a quiet room, so reject it loudly.
+    if (Number.isNaN(sinceTime)) {
+      return res.status(400).json({
+        error: `Invalid 'since' timestamp: ${JSON.stringify(since)}. Expected an ISO 8601 timestamp, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
+    // A date-time with no timezone designator ("2026-07-23T16:10:00") is parsed
+    // in the SERVER's local timezone, not the caller's. Agents polling from a
+    // different timezone would silently get the wrong window, so require an
+    // explicit offset (Z or ±HH:MM) and make the cursor absolute.
+    if (/\d[T ]\d/.test(since) && !/(Z|[+-]\d{2}:?\d{2})$/.test(since.trim())) {
+      return res.status(400).json({
+        error: `Ambiguous 'since' timestamp: ${JSON.stringify(since)} has no timezone offset and would be interpreted in the server's timezone. Append 'Z' for UTC or an explicit offset, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
     roomMessages = roomMessages.filter(
       (m) => new Date(m.timestamp).getTime() > sinceTime
     );
   }
 
+  const max = parseInt(limit);
+  const matched = roomMessages.length;
+
+  // Truncation direction matters.
+  //   - No `since`: the caller wants the most recent N, so take the tail.
+  //   - With `since`: the caller is walking forward through a backlog. Taking
+  //     the tail would return the NEWEST N and skip the oldest unseen ones —
+  //     and because the caller then advances its cursor past them, they would
+  //     never be seen again. Take the head so repeated polls walk the backlog
+  //     contiguously.
+  const page = since ? roomMessages.slice(0, max) : roomMessages.slice(-max);
+
   res.json({
-    messages: roomMessages.slice(-parseInt(limit)),
+    messages: page,
+    // `matched` is the full size of the window before truncation, so callers
+    // can tell "50 messages" from "50 of 120 messages".
+    matched,
+    returned: page.length,
+    hasMore: page.length < matched,
   });
 });
 
@@ -826,22 +938,53 @@ app.get("/api/notifications/:agentId", (req, res) => {
 
   // Match by agent_id OR agent_name (case-insensitive) so offline agents
   // that were @mentioned can retrieve their notifications after joining.
-  let query = "SELECT * FROM notifications WHERE (agent_id = ? OR LOWER(agent_name) = LOWER(?))";
+  const match = "(agent_id = ? OR LOWER(agent_name) = LOWER(?))";
   const params = [agentId, agentName || agentId];
 
+  let query = `SELECT * FROM notifications WHERE ${match}`;
   if (unreadOnly === "true") {
     query += " AND is_read = 0";
   }
 
-  query += " ORDER BY created_at DESC LIMIT 50";
+  // Bounded page, but the caller is told the true totals so it can tell
+  // "50 notifications" from "50 of 120" — and page back with `offset`
+  // instead of older notifications being permanently unreachable.
+  const max = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
+  const offset = parseInt(req.query.offset || "0", 10) || 0;
+  query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
 
-  db.all(query, params, (err, rows) => {
+  db.all(query, [...params, max, offset], (err, rows) => {
     if (err) {
       logger.error("Failed to retrieve notifications:", err);
       return res.status(500).json({ success: false, error: "Database error" });
     }
 
-    res.json({ success: true, notifications: rows });
+    // Real totals, counted in SQL rather than inferred from the page.
+    db.get(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread
+         FROM notifications WHERE ${match}`,
+      params,
+      (countErr, counts) => {
+        if (countErr) {
+          logger.error("Failed to count notifications:", countErr);
+          return res
+            .status(500)
+            .json({ success: false, error: "Database error" });
+        }
+
+        const total = counts?.total || 0;
+        const unread = counts?.unread || 0;
+        res.json({
+          success: true,
+          notifications: rows,
+          returned: rows.length,
+          total,
+          unread,
+          hasMore: offset + rows.length < (unreadOnly === "true" ? unread : total),
+        });
+      }
+    );
   });
 });
 
@@ -890,6 +1033,45 @@ io.on("connection", (socket) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
+
+/**
+ * Graceful shutdown.
+ *
+ * Message/task/notification writes use fire-and-forget `db.run(...)`, so
+ * statements can still be queued in the sqlite3 driver when systemd sends
+ * SIGTERM. Without this, a restart silently drops whatever was in flight —
+ * messages that were acknowledged to the sender with `{success: true}`.
+ * db.close() waits for queued statements to finish before closing.
+ */
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`${signal} received — draining pending database writes`);
+
+  // Stop accepting new work. Socket.IO holds persistent connections, so
+  // httpServer.close() would never fire its callback until every agent
+  // disconnects — the DB flush must NOT be gated behind it.
+  io.close();
+  httpServer.close();
+
+  // This is the part that actually matters for durability: db.close() waits
+  // for queued statements to finish before closing.
+  db.close((err) => {
+    if (err) logger.error("Error closing database:", err);
+    else logger.info("Database closed cleanly");
+    process.exit(0);
+  });
+
+  // Don't hang forever if a socket refuses to close.
+  setTimeout(() => {
+    logger.error("Shutdown timed out — forcing exit");
+    process.exit(1);
+  }, 5000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function startServer() {
   await initializeSystem();
