@@ -291,14 +291,25 @@ server.registerTool(
   "get_messages",
   {
     title: "Get Messages",
-    description: "Get recent messages from current room",
+    description:
+      "Get messages from the current room. To poll efficiently: call once with " +
+      "no arguments, then reuse the 'Next poll: since=<ISO>' cursor printed at " +
+      "the end of the output as the `since` argument on every later call — you " +
+      "then receive only new messages. Pass limit:0 with `since` to get just " +
+      "the COUNT of new messages without transferring any. Do NOT build a " +
+      "`since` value from the displayed [3:04:12 PM] times; they are local " +
+      "clock times, not valid timestamps, and will be rejected.",
     inputSchema: {
       since: z.string().optional().describe(
         "Full ISO 8601 timestamp to get messages after, e.g. 2026-07-23T21:00:00.000Z. " +
         "Must be a complete date+time — a clock time alone ('4:10 PM') is rejected. " +
         "Use the 'next poll' cursor printed at the end of this tool's output."
       ),
-      limit: z.number().optional().describe("Maximum number of messages (default: 50)"),
+      limit: z.number().optional().describe(
+        "Maximum number of messages (default: 50). Use 0 with `since` to get " +
+        "only the COUNT of new messages without transferring any of them; the " +
+        "response still reports how many matched."
+      ),
     },
   },
   async (params) => {
@@ -319,8 +330,8 @@ server.registerTool(
       // Set SYMPHONY_USE_MESSAGE_CACHE=true for single-agent local use where
       // speed matters more than cross-machine correctness.
       if (USE_MESSAGE_CACHE && !params.since && messageHistory.length > 0) {
-        const limit = params.limit || 50;
-        const messages = messageHistory.slice(-limit);
+        const limit = params.limit ?? 50;
+        const messages = limit === 0 ? [] : messageHistory.slice(-limit);
         return {
           content: [
             {
@@ -331,7 +342,14 @@ server.registerTool(
         };
       }
 
-      const response = await transport.getMessages(currentRoom, params.since, params.limit || 50);
+      // `params.limit || 50` turned an explicit limit of 0 into 50, so a
+      // count-only query silently fetched a full page while the header
+      // claimed nothing was fetched. Nullish-coalesce so 0 survives.
+      const response = await transport.getMessages(
+        currentRoom,
+        params.since,
+        params.limit ?? 50
+      );
 
       const messages = response.data.messages;
       const { matched, hasMore } = response.data;
@@ -339,11 +357,13 @@ server.registerTool(
       // Never report a truncated page as if it were the whole window — that is
       // the same silent under-report the `since` filter used to produce.
       const header =
-        hasMore && typeof matched === "number"
-          ? `Retrieved ${messages.length} of ${matched} matching messages ` +
-            `(TRUNCATED — ${matched - messages.length} older ones not shown; ` +
-            `poll again with the cursor below to continue, or raise 'limit')`
-          : `Retrieved ${messages.length} messages from server`;
+        params.limit === 0 && typeof matched === "number"
+          ? `${matched} matching message(s) — count only, none fetched`
+          : hasMore && typeof matched === "number"
+            ? `Retrieved ${messages.length} of ${matched} matching messages ` +
+              `(TRUNCATED — ${matched - messages.length} older ones not shown; ` +
+              `poll again with the cursor below to continue, or raise 'limit')`
+            : `Retrieved ${messages.length} messages from server`;
 
       return {
         content: [
@@ -374,7 +394,12 @@ server.registerTool(
   "get_notifications",
   {
     title: "Get Notifications",
-    description: "Get your notifications and mentions",
+    description:
+      "Get @mentions addressed to you, including ones sent while you were " +
+      "offline. Reports the true unread total, which may exceed the page " +
+      "shown. Mentions from other rooms are included and labelled '{room: x}' — " +
+      "pass currentRoomOnly:true to exclude them. Use mark_notification_read " +
+      "to clear one, otherwise your unread count only ever grows.",
     inputSchema: {
       unreadOnly: z.boolean().optional().describe("Only return unread notifications"),
       type: z.enum(["mention", "keyword", "task", "system"]).optional().describe("Filter by notification type"),
@@ -478,6 +503,247 @@ server.registerTool(
 );
 
 server.registerTool(
+  "update_task",
+  {
+    title: "Update Task",
+    description:
+      "Change a task's status, assignee or priority. Without this a task can " +
+      "be created and listed but never moved to done.",
+    inputSchema: {
+      taskId: z.string().describe("Task id (from get_tasks)"),
+      status: z.enum(["todo", "in_progress", "review", "done", "blocked"]).optional()
+        .describe("New status"),
+      assignee: z.string().optional().describe("Agent name to assign to"),
+      priority: z.enum(["low", "medium", "high"]).optional().describe("New priority"),
+    },
+  },
+  async (params) => {
+    if (!transport) {
+      return {
+        content: [{ type: "text", text: "Not connected to a hub. Use room_join first." }],
+        isError: true,
+      };
+    }
+    try {
+      const { taskId, ...patch } = params;
+      const res = await transport.updateTask(taskId, patch);
+      const task = res.data?.task;
+      return {
+        content: [
+          {
+            type: "text",
+            text: task
+              ? `Task updated: "${task.title}" -> status=${task.status}, assignee=${task.assignee || "unassigned"}, priority=${task.priority}`
+              : `Task ${taskId} updated`,
+          },
+        ],
+      };
+    } catch (error) {
+      const detail = error.response?.data?.error;
+      return {
+        content: [{ type: "text", text: `Failed to update task: ${detail || error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "mark_notification_read",
+  {
+    title: "Mark Notification Read",
+    description:
+      "Mark one notification as read so it stops counting toward your unread " +
+      "total. Notification ids come from get_notifications.",
+    inputSchema: {
+      notificationId: z.string().describe("Notification id from get_notifications"),
+    },
+  },
+  async (params) => {
+    if (!transport) {
+      return {
+        content: [{ type: "text", text: "Not connected to a hub. Use room_join first." }],
+        isError: true,
+      };
+    }
+    try {
+      const res = await transport.markNotificationRead(params.notificationId);
+      const updated = res.data?.updated;
+      return {
+        content: [
+          {
+            type: "text",
+            text: updated
+              ? `Notification ${params.notificationId} marked read`
+              : `No notification matched id ${params.notificationId} (already read, or wrong id)`,
+          },
+        ],
+      };
+    } catch (error) {
+      const detail = error.response?.data?.error;
+      return {
+        content: [{ type: "text", text: `Failed to mark notification read: ${detail || error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "list_rooms",
+  {
+    title: "List Rooms",
+    description: "List every room on the hub with how many agents are in each.",
+    inputSchema: {},
+  },
+  async () => {
+    if (!transport) {
+      return {
+        content: [{ type: "text", text: "Not connected to a hub. Use room_join first." }],
+        isError: true,
+      };
+    }
+    try {
+      const res = await transport.getRooms();
+      const rooms = res.data?.rooms || [];
+      const lines = rooms
+        .map((r) => `  ${r.name}${r.name === currentRoom ? " (current)" : ""}: ${r.agentCount} agents`)
+        .join("\n");
+      return {
+        content: [
+          { type: "text", text: rooms.length ? `Rooms (${rooms.length}):\n${lines}` : "No rooms" },
+        ],
+      };
+    } catch (error) {
+      const detail = error.response?.data?.error;
+      return {
+        content: [{ type: "text", text: `Failed to list rooms: ${detail || error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "list_agents",
+  {
+    title: "List Agents",
+    description: "List the agents currently in a room — who you can @mention.",
+    inputSchema: {
+      room: z.string().optional().describe("Room name (defaults to your current room)"),
+    },
+  },
+  async (params) => {
+    const target = params.room || currentRoom;
+    if (!transport || !target) {
+      return {
+        content: [{ type: "text", text: "Not in a room. Use room_join first, or pass `room`." }],
+        isError: true,
+      };
+    }
+    try {
+      const res = await transport.getAgents(target);
+      const list = res.data?.agents || [];
+      const lines = list
+        .map((a) => `  ${a.name}${a.status ? ` [${a.status}]` : ""}`)
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text: list.length
+              ? `Agents in "${target}" (${list.length}):\n${lines}`
+              : `No agents currently in "${target}"`,
+          },
+        ],
+      };
+    } catch (error) {
+      const detail = error.response?.data?.error;
+      return {
+        content: [{ type: "text", text: `Failed to list agents: ${detail || error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "get_room_stats",
+  {
+    title: "Get Room Stats",
+    description:
+      "Count messages/agents per room WITHOUT fetching message bodies. " +
+      "Use this to check whether a room is worth polling, or how far behind " +
+      "you are, instead of pulling messages just to count them.",
+    inputSchema: {
+      allRooms: z.boolean().optional().describe(
+        "Include every room. Default false — only the room you are in."
+      ),
+    },
+  },
+  async (params) => {
+    if (!transport) {
+      return {
+        content: [
+          { type: "text", text: "Not connected to a hub. Use room_join first." }
+        ],
+        isError: true
+      };
+    }
+
+    try {
+      const response = await transport.getStats();
+      const data = response.data || {};
+      const rooms = data.rooms || [];
+      const shown = params.allRooms
+        ? rooms
+        : rooms.filter((r) => r.name === currentRoom);
+
+      if (!shown.length) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: currentRoom
+                ? `No stats for room "${currentRoom}" (it may have no activity yet).`
+                : "Not in a room — pass allRooms: true to see every room."
+            }
+          ]
+        };
+      }
+
+      const lines = shown
+        .sort((a, b) => b.messageCount - a.messageCount)
+        .map(
+          (r) =>
+            `  ${r.name}${r.name === currentRoom ? " (current)" : ""}: ` +
+            `${r.messageCount} messages, ${r.agentCount} agents`
+        )
+        .join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Room stats (counts only — no messages fetched):\n${lines}\n\n` +
+              `Hub totals: ${data.totalRooms} rooms, ${data.totalAgents} agents, ${data.totalTasks} tasks`
+          }
+        ]
+      };
+    } catch (error) {
+      const detail = error.response?.data?.error;
+      return {
+        content: [
+          { type: "text", text: `Failed to get stats: ${detail || error.message}` }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
   "create_task",
   {
     title: "Create Task",
@@ -565,8 +831,10 @@ server.registerTool(
       });
 
       const tasks = response.data.tasks;
+      // The id must be shown: update_task takes a taskId, and this is the only
+      // tool that can supply one.
       const taskList = tasks.map(task =>
-        `[${task.status.toUpperCase()}] ${task.title}\n  Description: ${task.description}\n  Assignee: ${task.assignee || 'Unassigned'}\n  Priority: ${task.priority}\n  Created: ${new Date(task.createdAt).toLocaleString()}`
+        `[${task.status.toUpperCase()}] ${task.title}\n  id: ${task.id}\n  Description: ${task.description}\n  Assignee: ${task.assignee || 'Unassigned'}\n  Priority: ${task.priority}\n  Created: ${new Date(task.createdAt).toLocaleString()}`
       ).join('\n\n');
 
       return {

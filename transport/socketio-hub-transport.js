@@ -206,6 +206,38 @@ export default class SocketIoHubTransport extends Transport {
   }
 
   /**
+   * GET /api/stats — room/agent/task counts and per-room message counts.
+   * Cheap: returns counts only, never message bodies.
+   */
+  async getStats() {
+    return this._axios.get(`/api/stats`);
+  }
+
+  /**
+   * GET /api/rooms — list every room with agent counts.
+   */
+  async getRooms() {
+    return this._axios.get(`/api/rooms`);
+  }
+
+  /**
+   * GET /api/agents/:room — who is currently in a room.
+   * @param {string} room
+   */
+  async getAgents(room) {
+    return this._axios.get(`/api/agents/${room}`);
+  }
+
+  /**
+   * POST /api/notifications/:id/read — mark one notification read.
+   * Without this an agent's unread count can only ever grow.
+   * @param {string} notificationId
+   */
+  async markNotificationRead(notificationId) {
+    return this._axios.post(`/api/notifications/${notificationId}/read`);
+  }
+
+  /**
    * GET /api/tasks/:room
    * @param {string} room
    * @param {object} filter

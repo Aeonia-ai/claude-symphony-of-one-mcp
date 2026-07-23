@@ -61,18 +61,37 @@ describe("MCP end-to-end", () => {
     await srv.stop();
   });
 
-  it("handshakes and lists all 12 tools", async () => {
+  it("handshakes and lists all 17 tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    assert.equal(tools.length, 12, `expected 12 tools, got ${tools.length}`);
+    assert.equal(tools.length, 17, `expected 17 tools, got ${tools.length}`);
     for (const expected of [
       "room_join",
       "send_message",
       "get_messages",
       "get_notifications",
+      "mark_notification_read",
+      "update_task",
+      "list_rooms",
+      "list_agents",
+      "get_room_stats",
     ]) {
       assert.ok(names.includes(expected), `missing tool: ${expected}`);
     }
+  });
+
+  it("get_messages describes the since/cursor workflow in its listing", async () => {
+    // Agents pick tools from the listing; a one-line description hid `since`
+    // entirely, so nobody knew incremental polling existed.
+    const { tools } = await client.listTools();
+    const gm = tools.find((t) => t.name === "get_messages");
+    assert.match(gm.description, /since/i, "listing must mention `since`");
+    assert.match(gm.description, /cursor/i, "listing must mention the cursor");
+    assert.match(
+      gm.description,
+      /limit:0|limit: 0/i,
+      "listing should mention the count-only form"
+    );
   });
 
   it("room_join and send_message round-trip", async () => {
@@ -388,6 +407,123 @@ describe("MCP end-to-end", () => {
       new RegExp(marker),
       "a message from another agent must be visible to this MCP client"
     );
+  });
+
+  it("counts new messages without transferring them (limit: 0)", async () => {
+    const all = await client.callTool({ name: "get_messages", arguments: {} });
+    const cursor = textOf(all).match(/Next poll: since=(\S+)/)[1];
+
+    for (let i = 0; i < 4; i++) {
+      await client.callTool({
+        name: "send_message",
+        arguments: { content: `countable-${i}` },
+      });
+    }
+
+    const res = await client.callTool({
+      name: "get_messages",
+      arguments: { since: cursor, limit: 0 },
+    });
+    const text = textOf(res);
+    assert.match(
+      text,
+      /4 matching message\(s\) — count only, none fetched/,
+      `limit:0 should report a count and send nothing; got: ${text}`
+    );
+    assert.ok(
+      !/countable-0/.test(text),
+      "limit:0 must not transfer message bodies"
+    );
+  });
+
+  it("limit: 0 without `since` does not return the whole room", async () => {
+    // slice(-0) is slice(0) — the entire array — so a zero limit used to
+    // return everything instead of nothing.
+    const res = await client.callTool({
+      name: "get_messages",
+      arguments: { limit: 0 },
+    });
+    assert.ok(
+      !/countable-0/.test(textOf(res)),
+      `limit:0 must not dump the room; got: ${textOf(res).slice(0, 200)}`
+    );
+  });
+
+  it("update_task moves a task to done", async () => {
+    await client.callTool({
+      name: "create_task",
+      arguments: { title: "closeable", description: "will be completed" },
+    });
+    const list = await client.callTool({ name: "get_tasks", arguments: {} });
+    const id = textOf(list).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    assert.ok(id, `could not find a task id in: ${textOf(list)}`);
+
+    const res = await client.callTool({
+      name: "update_task",
+      arguments: { taskId: id, status: "done" },
+    });
+    assert.ok(!res.isError, `update_task errored: ${textOf(res)}`);
+    assert.match(textOf(res), /done/, "task should report its new status");
+  });
+
+  it("mark_notification_read clears an unread mention", async () => {
+    const outsiderId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: outsiderId, agentName: "reader-peer", capabilities: {} }),
+    });
+    await fetch(`http://localhost:${srv.port}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: outsiderId, content: "@mcp-test-agent clear me" }),
+    });
+
+    const before = await (
+      await fetch(
+        `http://localhost:${srv.port}/api/notifications/x?agentName=mcp-test-agent&unreadOnly=true`
+      )
+    ).json();
+    assert.ok(before.unread > 0, "should have unread notifications to clear");
+
+    const res = await client.callTool({
+      name: "mark_notification_read",
+      arguments: { notificationId: before.notifications[0].id },
+    });
+    assert.ok(!res.isError, `mark_notification_read errored: ${textOf(res)}`);
+
+    const after = await (
+      await fetch(
+        `http://localhost:${srv.port}/api/notifications/x?agentName=mcp-test-agent&unreadOnly=true`
+      )
+    ).json();
+    assert.equal(
+      after.unread,
+      before.unread - 1,
+      "unread total must drop by exactly one"
+    );
+  });
+
+  it("list_rooms and list_agents expose who is where", async () => {
+    const rooms = await client.callTool({ name: "list_rooms", arguments: {} });
+    assert.ok(!rooms.isError, `list_rooms errored: ${textOf(rooms)}`);
+    assert.match(textOf(rooms), new RegExp(room), "current room should be listed");
+
+    const agents = await client.callTool({ name: "list_agents", arguments: {} });
+    assert.ok(!agents.isError, `list_agents errored: ${textOf(agents)}`);
+    assert.match(
+      textOf(agents),
+      /mcp-test-agent/,
+      "the calling agent should appear in its own room"
+    );
+  });
+
+  it("get_room_stats counts messages without fetching them", async () => {
+    const res = await client.callTool({ name: "get_room_stats", arguments: {} });
+    const text = textOf(res);
+    assert.ok(!res.isError, `get_room_stats errored: ${text}`);
+    assert.match(text, new RegExp(`${room}.*\\d+ messages`), `got: ${text}`);
+    assert.ok(!/countable-0/.test(text), "stats must not include message bodies");
   });
 
   it("tools report a clean error when not in a room", async () => {

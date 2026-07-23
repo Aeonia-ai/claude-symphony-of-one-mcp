@@ -722,7 +722,11 @@ app.get("/api/messages/:room", (req, res) => {
     );
   }
 
-  const max = parseInt(limit);
+  // `slice(-0)` is `slice(0)` — the WHOLE array — so a limit of 0 would return
+  // everything instead of nothing. Clamp to a non-negative integer and handle
+  // 0 explicitly, so `limit=0` is a usable "count only, send no messages" query.
+  const parsed = parseInt(limit);
+  const max = Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
   const matched = roomMessages.length;
 
   // Truncation direction matters.
@@ -732,7 +736,12 @@ app.get("/api/messages/:room", (req, res) => {
   //     and because the caller then advances its cursor past them, they would
   //     never be seen again. Take the head so repeated polls walk the backlog
   //     contiguously.
-  const page = since ? roomMessages.slice(0, max) : roomMessages.slice(-max);
+  const page =
+    max === 0
+      ? [] // count-only query
+      : since
+        ? roomMessages.slice(0, max)
+        : roomMessages.slice(-max);
 
   res.json({
     messages: page,
