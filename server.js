@@ -279,6 +279,44 @@ function safeWatermark(room) {
   return Math.min(...set) - 1;
 }
 
+// Append a message to a room's in-memory buffer AND bound it. Previously
+// MESSAGE_HISTORY_LIMIT was applied only at boot, so the buffer grew without
+// limit at runtime — a slow memory leak on any long-lived busy room. Trimmed
+// messages stay on disk and are served by the /api/messages DB fallback.
+function recordMessage(room, message) {
+  const arr = messages.get(room);
+  if (!arr) return;
+  arr.push(message);
+  const overflow = arr.length - MESSAGE_HISTORY_LIMIT;
+  if (overflow > 0) arr.splice(0, overflow);
+}
+
+// How long to keep already-read notifications before pruning (days).
+const NOTIFICATION_RETENTION_DAYS = parseInt(
+  process.env.NOTIFICATION_RETENTION_DAYS || "14",
+  10
+);
+
+/**
+ * Periodic storage hygiene. Two tables grew without bound:
+ *  - agent_memory: expired rows were hidden on read but never deleted.
+ *  - notifications: nothing was ever pruned (marking read didn't delete).
+ * Unread notifications are NEVER pruned — that is the live signal — only read
+ * ones past the retention window, so the backlog shrinks without losing mentions.
+ */
+function pruneExpiredData() {
+  dbRun(
+    "DELETE FROM agent_memory WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')",
+    [],
+    "prune expired memory"
+  );
+  dbRun(
+    `DELETE FROM notifications WHERE is_read = 1 AND created_at < datetime('now', ?)`,
+    [`-${NOTIFICATION_RETENTION_DAYS} days`],
+    "prune old read notifications"
+  );
+}
+
 // Tolerate malformed/NULL JSON columns rather than throwing during boot.
 function safeJsonParse(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -399,7 +437,24 @@ async function loadDataFromDatabase() {
           if (agentErr) {
             logger.error("Failed to load agents from database:", agentErr);
           } else {
-            agentRows.forEach((row) => {
+            // Keep only the newest record per (name, room). Agents regenerate
+            // their id every session and old rows were never reaped, so a busy
+            // deployment accumulated stale duplicates that inflated presence and
+            // could misdirect mention classification. Newest-by-last_active wins;
+            // the rest are deleted here so the backlog clears on this boot rather
+            // than only as agents happen to rejoin.
+            const byKey = new Map();
+            for (const row of agentRows) {
+              const key = `${(row.name || "").toLowerCase()} ${row.room}`;
+              const prev = byKey.get(key);
+              if (!prev || (row.last_active || "") > (prev.last_active || "")) {
+                if (prev) dbRun("DELETE FROM agents WHERE id = ?", [prev.id], `dedupe stale agent ${prev.id}`);
+                byKey.set(key, row);
+              } else {
+                dbRun("DELETE FROM agents WHERE id = ?", [row.id], `dedupe stale agent ${row.id}`);
+              }
+            }
+            for (const row of byKey.values()) {
               agents.set(row.id, {
                 id: row.id,
                 name: row.name,
@@ -412,8 +467,12 @@ async function loadDataFromDatabase() {
               });
               const room = rooms.get(row.room);
               if (room) room.agents.add(row.id);
-            });
-            logger.info(`Loaded ${agentRows.length} agents from database`);
+            }
+            const dropped = agentRows.length - byKey.size;
+            logger.info(
+              `Loaded ${byKey.size} agents from database` +
+                (dropped > 0 ? ` (dropped ${dropped} stale duplicate rows)` : "")
+            );
           }
         });
 
@@ -577,7 +636,7 @@ function setupFileWatcher(roomName) {
       metadata: { filePath: relativePath, action: "change" },
     };
 
-    messages.get(roomName)?.push(message);
+    recordMessage(roomName, message);
     io.to(roomName).emit("message", message);
   });
 
@@ -592,7 +651,7 @@ function setupFileWatcher(roomName) {
       metadata: { filePath: relativePath, action: "add" },
     };
 
-    messages.get(roomName)?.push(message);
+    recordMessage(roomName, message);
     io.to(roomName).emit("message", message);
   });
 
@@ -607,7 +666,7 @@ function setupFileWatcher(roomName) {
       metadata: { filePath: relativePath, action: "delete" },
     };
 
-    messages.get(roomName)?.push(message);
+    recordMessage(roomName, message);
     io.to(roomName).emit("message", message);
   });
 
@@ -691,7 +750,7 @@ app.post("/api/join/:room", (req, res) => {
     metadata: { type: "join" },
   };
 
-  messages.get(roomName).push(joinMessage);
+  recordMessage(roomName, joinMessage);
 
   // Persist message to database
   dbRun(
@@ -742,7 +801,7 @@ app.post("/api/leave/:agentId", (req, res) => {
       room: agent.room,
     };
 
-    messages.get(agent.room).push(leaveMessage);
+    recordMessage(agent.room, leaveMessage);
     io.to(agent.room).emit("message", leaveMessage);
   }
 
@@ -810,7 +869,7 @@ app.post("/api/send", (req, res) => {
         });
       }
 
-      messages.get(agent.room).push(message);
+      recordMessage(agent.room, message);
 
       // Update agent last active time
       agent.lastActive = new Date().toISOString();
@@ -1127,7 +1186,7 @@ app.post("/api/broadcast/:room", (req, res) => {
     from,
   };
 
-  messages.get(roomName)?.push(message);
+  recordMessage(roomName, message);
   io.to(roomName).emit("message", message);
 
   res.json({ success: true, messageId: message.id });
@@ -1408,6 +1467,11 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function startServer() {
   await initializeSystem();
+
+  // Storage hygiene: once at boot, then hourly. Unref so it never holds the
+  // process open during shutdown.
+  pruneExpiredData();
+  setInterval(pruneExpiredData, 60 * 60 * 1000).unref();
 
   httpServer.listen(PORT, () => {
     logger.info(`Claude Gateway Hub started on port ${PORT}`);
