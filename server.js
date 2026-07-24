@@ -155,6 +155,10 @@ async function initializeSystem() {
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
       )`);
 
+      // Index for the /api/messages DB fallback: `since` windows that reach
+      // past the in-memory horizon query the table directly.
+      db.run("CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room, timestamp)");
+
       db.run(`CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         room TEXT,
@@ -238,6 +242,41 @@ function nextTimestamp(room) {
   const ts = prev >= now ? prev + 1 : now;
   lastIssuedTs.set(room, ts);
   return new Date(ts).toISOString();
+}
+
+/**
+ * In-flight write watermark.
+ *
+ * A timestamp is reserved synchronously, but the message only becomes visible
+ * (pushed to the array) when its DB write completes. So a later message can be
+ * visible while an earlier-timestamped one is still writing — a reader that
+ * advances its cursor to the later one then skips the earlier one forever when
+ * it lands. This was the measured ~4% live-poll miss under burst.
+ *
+ * Track reserved-but-not-yet-settled timestamps per room. Reads refuse to
+ * return (and so cannot advance a cursor past) any message at or beyond the
+ * oldest in-flight write, until that write settles. Latency cost is a few ms
+ * under burst; on failure the timestamp is released immediately.
+ */
+const pendingTs = new Map(); // room -> Set<ms>
+
+function reservePending(room, iso) {
+  const ms = new Date(iso).getTime();
+  if (!pendingTs.has(room)) pendingTs.set(room, new Set());
+  pendingTs.get(room).add(ms);
+  return ms;
+}
+
+function releasePending(room, ms) {
+  pendingTs.get(room)?.delete(ms);
+}
+
+// Highest timestamp (ms) safe to serve: strictly below the oldest in-flight
+// write, or Infinity when nothing is pending.
+function safeWatermark(room) {
+  const set = pendingTs.get(room);
+  if (!set || set.size === 0) return Infinity;
+  return Math.min(...set) - 1;
 }
 
 // Tolerate malformed/NULL JSON columns rather than throwing during boot.
@@ -480,6 +519,44 @@ function findAgentByName(agentName) {
   return null;
 }
 
+// All agent records matching a name. An agent that has joined several rooms has
+// one record per room, so mention classification must consider ALL of them —
+// findAgentByName returns whichever comes first in Map order, which could be a
+// different room and wrongly reads as "not in this room".
+function findAgentsByName(agentName) {
+  const lower = agentName.toLowerCase();
+  return Array.from(agents.values()).filter(
+    (a) => a.name.toLowerCase() === lower
+  );
+}
+
+// Classify a mention against the sender's room: notified (a match IS in this
+// room), elsewhere (real agent, but only in other rooms), or unknown (no such
+// agent anywhere — almost always a typo).
+function classifyMention(name, room) {
+  const matches = findAgentsByName(name);
+  if (!matches.length) return { kind: "unknown", name };
+  if (matches.some((a) => a.room === room)) return { kind: "notified", name };
+  const rooms = [...new Set(matches.map((a) => a.room))];
+  return { kind: "elsewhere", name, rooms };
+}
+
+// Drop any prior records for the same (name, room) held under a DIFFERENT agent
+// id. Agents regenerate their id every session, so without this each rejoin
+// leaves a stale "active" row, inflating presence and corrupting mention
+// classification. Keeps one record per (name, room): the current one.
+function reapDuplicateAgents(keepId, name, room) {
+  const lower = name.toLowerCase();
+  for (const [id, a] of agents) {
+    if (id !== keepId && a.room === room && a.name.toLowerCase() === lower) {
+      agents.delete(id);
+      const r = rooms.get(room);
+      if (r) r.agents.delete(id);
+      dbRun("DELETE FROM agents WHERE id = ?", [id], `reap stale agent ${id}`);
+    }
+  }
+}
+
 // Setup file watcher for a room
 function setupFileWatcher(roomName) {
   if (fileWatcher.has(roomName)) return;
@@ -584,6 +661,9 @@ app.post("/api/join/:room", (req, res) => {
 
   agents.set(agentId, agent);
 
+  // Remove stale records for this same (name, room) under old session ids.
+  reapDuplicateAgents(agentId, agentName, roomName);
+
   // Persist agent to database
   dbRun(
     "INSERT OR REPLACE INTO agents (id, name, room, capabilities, joined_at, last_active, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -667,6 +747,10 @@ app.post("/api/leave/:agentId", (req, res) => {
   }
 
   agents.delete(agentId);
+  // Delete the DB row too — leaving it behind meant a restart rehydrated the
+  // departed agent as active, so presence and mention classification saw
+  // agents who had left.
+  dbRun("DELETE FROM agents WHERE id = ?", [agentId], `leave ${agentId}`);
   res.json({ success: true });
 });
 
@@ -693,6 +777,10 @@ app.post("/api/send", (req, res) => {
     room: agent.room,
   };
 
+  // Mark this timestamp in-flight so readers won't advance a cursor past it
+  // (or past any later message) until the write settles.
+  const pendingMs = reservePending(agent.room, message.timestamp);
+
   // Persist BEFORE broadcasting or acknowledging. Previously the emit and the
   // 200 both happened regardless of the write, so a failed INSERT meant every
   // other agent saw a message that would not survive a restart, and the sender
@@ -711,6 +799,7 @@ app.post("/api/send", (req, res) => {
       message.timestamp,
     ],
     function (err) {
+      releasePending(agent.room, pendingMs);
       if (err) {
         logger.error(
           `Failed to persist message from ${agent.name} in ${agent.room}: ${err.message}`
@@ -753,10 +842,10 @@ app.post("/api/send", (req, res) => {
       const elsewhere = [];
       const unknown = [];
       for (const name of mentions) {
-        const found = findAgentByName(name);
-        if (!found) unknown.push(name);
-        else if (found.room === agent.room) notified.push(name);
-        else elsewhere.push({ name, room: found.room });
+        const c = classifyMention(name, agent.room);
+        if (c.kind === "notified") notified.push(name);
+        else if (c.kind === "elsewhere") elsewhere.push({ name, room: c.rooms.join(", ") });
+        else unknown.push(name);
       }
 
       res.json({
@@ -771,49 +860,8 @@ app.post("/api/send", (req, res) => {
   );
 });
 
-app.get("/api/messages/:room", (req, res) => {
-  const { room } = req.params;
-  const { since, limit = 100 } = req.query;
-
-  // Sort by timestamp before paging. Timestamps are reserved synchronously but
-  // the array is appended inside the DB write callback, so under concurrency
-  // writes land out of order. Paging by array position would then set the
-  // cursor to a message that is not the page maximum, which both re-returns
-  // messages already seen and skips ones that were never returned.
-  // Copy first — never reorder the stored array during a read.
-  let roomMessages = [...(messages.get(room) || [])].sort(
-    (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-  );
-
-  if (since) {
-    const sinceTime = new Date(since).getTime();
-    // An unparseable `since` yields NaN, and every `> NaN` comparison is false —
-    // which would silently return zero messages instead of erroring. A false
-    // "nothing new" is indistinguishable from a quiet room, so reject it loudly.
-    if (Number.isNaN(sinceTime)) {
-      return res.status(400).json({
-        error: `Invalid 'since' timestamp: ${JSON.stringify(since)}. Expected an ISO 8601 timestamp, e.g. 2026-07-23T21:00:00.000Z`,
-      });
-    }
-    // A date-time with no timezone designator ("2026-07-23T16:10:00") is parsed
-    // in the SERVER's local timezone, not the caller's. Agents polling from a
-    // different timezone would silently get the wrong window, so require an
-    // explicit offset (Z or ±HH:MM) and make the cursor absolute.
-    if (/\d[T ]\d/.test(since) && !/(Z|[+-]\d{2}:?\d{2})$/.test(since.trim())) {
-      return res.status(400).json({
-        error: `Ambiguous 'since' timestamp: ${JSON.stringify(since)} has no timezone offset and would be interpreted in the server's timezone. Append 'Z' for UTC or an explicit offset, e.g. 2026-07-23T21:00:00.000Z`,
-      });
-    }
-    roomMessages = roomMessages.filter(
-      (m) => new Date(m.timestamp).getTime() > sinceTime
-    );
-  }
-
-  // `slice(-0)` is `slice(0)` — the WHOLE array — so a limit of 0 would return
-  // everything instead of nothing. Clamp to a non-negative integer and handle
-  // 0 explicitly, so `limit=0` is a usable "count only, send no messages" query.
-  const parsed = parseInt(limit);
-  const max = Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
+// Build the paged /api/messages response from an already sorted+filtered set.
+function buildMessagesResponse(res, roomMessages, since, max) {
   const matched = roomMessages.length;
 
   // Truncation direction matters.
@@ -851,6 +899,80 @@ app.get("/api/messages/:room", (req, res) => {
     hasMore: page.length < matched,
     ...(byAgent ? { byAgent } : {}),
   });
+}
+
+app.get("/api/messages/:room", (req, res) => {
+  const { room } = req.params;
+  const { since, limit = 100 } = req.query;
+
+  let sinceTime = null;
+  if (since) {
+    sinceTime = new Date(since).getTime();
+    // An unparseable `since` yields NaN, and every `> NaN` comparison is false —
+    // which would silently return zero messages instead of erroring. A false
+    // "nothing new" is indistinguishable from a quiet room, so reject it loudly.
+    if (Number.isNaN(sinceTime)) {
+      return res.status(400).json({
+        error: `Invalid 'since' timestamp: ${JSON.stringify(since)}. Expected an ISO 8601 timestamp, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
+    // A date-time with no timezone designator ("2026-07-23T16:10:00") is parsed
+    // in the SERVER's local timezone, not the caller's. Agents polling from a
+    // different timezone would silently get the wrong window, so require an
+    // explicit offset (Z or ±HH:MM) and make the cursor absolute.
+    if (/\d[T ]\d/.test(since) && !/(Z|[+-]\d{2}:?\d{2})$/.test(since.trim())) {
+      return res.status(400).json({
+        error: `Ambiguous 'since' timestamp: ${JSON.stringify(since)} has no timezone offset and would be interpreted in the server's timezone. Append 'Z' for UTC or an explicit offset, e.g. 2026-07-23T21:00:00.000Z`,
+      });
+    }
+  }
+
+  // `slice(-0)` is `slice(0)` — the WHOLE array — so a limit of 0 would return
+  // everything. Clamp to a non-negative integer; 0 means count-only.
+  const parsed = parseInt(limit);
+  const max = Number.isFinite(parsed) && parsed >= 0 ? parsed : 100;
+
+  // Hold back messages at or beyond the oldest in-flight write, so a cursor
+  // never advances past a message that has not landed yet.
+  const safeTs = safeWatermark(room);
+
+  // Sort a COPY by timestamp — never reorder the stored array during a read.
+  // Under concurrency writes land out of order, so paging by array position
+  // would set the cursor to a non-maximum message and skip/repeat.
+  const inMem = [...(messages.get(room) || [])].sort(
+    (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+  );
+  const oldestInMem = inMem.length
+    ? new Date(inMem[0].timestamp).getTime()
+    : Infinity;
+
+  // DB fallback: only the most recent MESSAGE_HISTORY_LIMIT messages per room
+  // are held in memory. A `since` that reaches before that horizon would
+  // otherwise silently return just the part of the window still in the tail,
+  // with no signal that older matches exist on disk. Query the table instead.
+  const needDb = since && sinceTime < oldestInMem;
+
+  if (!needDb) {
+    let rows = inMem;
+    if (since) rows = rows.filter((m) => new Date(m.timestamp).getTime() > sinceTime);
+    rows = rows.filter((m) => new Date(m.timestamp).getTime() <= safeTs);
+    return buildMessagesResponse(res, rows, since, max);
+  }
+
+  db.all(
+    "SELECT * FROM messages WHERE room = ? AND timestamp > ? ORDER BY timestamp ASC",
+    [room, new Date(sinceTime).toISOString()],
+    (err, dbRows) => {
+      if (err) {
+        logger.error(`Failed to read messages for room ${room}:`, err);
+        return res.status(500).json({ success: false, error: "Database error" });
+      }
+      const rows = dbRows
+        .map(rowToMessage)
+        .filter((m) => new Date(m.timestamp).getTime() <= safeTs);
+      return buildMessagesResponse(res, rows, since, max);
+    }
+  );
 });
 
 app.get("/api/rooms", (req, res) => {
