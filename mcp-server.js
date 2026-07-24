@@ -27,6 +27,22 @@ let messageHistory = [];
 let watchPatterns = [];
 
 /**
+ * Compact local timestamp for message display: date + time, so a message from
+ * last night can't be mistaken for one from this morning. The old bracket
+ * showed time only (`[8:54:15 PM]`), so a 12-hour-old message and a fresh one
+ * looked alike and had to be told apart by a meridiem read alone.
+ */
+function fmtLocal(ts) {
+  return new Date(ts).toLocaleString(undefined, {
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/**
  * Emit a copy-pasteable `since` cursor for the next poll.
  *
  * Message timestamps are stored as UTC ISO strings (`...Z`), so the cursor is
@@ -346,7 +362,7 @@ server.registerTool(
           content: [
             {
               type: "text",
-              text: `Retrieved ${messages.length} messages from local cache:\n\n${messages.map(m => `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.agentName}: ${m.content}`).join('\n')}`
+              text: `Retrieved ${messages.length} messages from local cache:\n\n${messages.map(m => `[${fmtLocal(m.timestamp)}] ${m.agentName}: ${m.content}`).join('\n')}`
             }
           ]
         };
@@ -398,7 +414,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `${header}:\n\n${messages.map(m => `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.agentName}: ${m.content}`).join('\n')}${formatCursor(messages)}`
+            text: `${header}:\n\n${messages.map(m => `[${fmtLocal(m.timestamp)}] ${m.agentName}: ${m.content}`).join('\n')}${formatCursor(messages)}`
           }
         ]
       };
