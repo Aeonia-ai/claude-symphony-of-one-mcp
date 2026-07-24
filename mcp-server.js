@@ -256,14 +256,24 @@ server.registerTool(
     try {
       const sent = await transport.sendMessage(params.content, params.metadata || {});
 
-      // Echo the mentions the SERVER actually parsed. Mention parsing has its
-      // own rules (dots, hyphens, dedupe), so an agent that assumes its @name
-      // resolved could be wrong with no way to tell.
-      const mentions = sent?.data?.mentions;
-      const mentionNote =
-        Array.isArray(mentions) && mentions.length
-          ? ` — notified: ${mentions.join(", ")}`
-          : "";
+      // Report who was ACTUALLY notified, not merely what parsed. A misspelled
+      // name parses fine and creates a notification nobody reads, so echoing
+      // the parsed list alone still reads as success.
+      const d = sent?.data || {};
+      const parts = [];
+      if (d.notified?.length) parts.push(`notified: ${d.notified.join(", ")}`);
+      if (d.elsewhere?.length) {
+        parts.push(
+          `NOT IN THIS ROOM: ${d.elsewhere.map((e) => `${e.name} (in ${e.room})`).join(", ")}`
+        );
+      }
+      if (d.unknown?.length) {
+        parts.push(
+          `NOBODY NOTIFIED — no agent named: ${d.unknown.join(", ")}. ` +
+            `Check the spelling with list_agents.`
+        );
+      }
+      const mentionNote = parts.length ? ` — ${parts.join(" | ")}` : "";
 
       return {
         content: [

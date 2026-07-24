@@ -314,6 +314,68 @@ describe("MCP end-to-end", () => {
     );
   });
 
+  it("send_message says so when a mention reaches nobody", async () => {
+    // A misspelled name parses perfectly and creates a notification row for an
+    // agent that does not exist, so the sender sees a successful mention while
+    // nobody is notified. This is the failure behind a real coordination error
+    // in production ("@ar-client-dev" for "@client-ar-dev"); the live DB holds
+    // 52 notifications addressed to names no agent has ever had.
+    const res = await client.callTool({
+      name: "send_message",
+      arguments: { content: "@definitely-not-an-agent please review" },
+    });
+    const text = textOf(res);
+    assert.ok(!res.isError, `send_message errored: ${text}`);
+    assert.match(
+      text,
+      /NOBODY NOTIFIED/,
+      `an unmatched mention must be called out, got: ${text}`
+    );
+    assert.match(text, /definitely-not-an-agent/);
+  });
+
+  it("send_message distinguishes a real agent in another room", async () => {
+    const otherRoom = `elsewhere-${randomUUID().slice(0, 6)}`;
+    const awayId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${otherRoom}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: awayId, agentName: "away-agent", capabilities: {} }),
+    });
+
+    const res = await client.callTool({
+      name: "send_message",
+      arguments: { content: "@away-agent are you there" },
+    });
+    const text = textOf(res);
+    assert.match(
+      text,
+      /NOT IN THIS ROOM/,
+      `a real agent in another room must be distinguished from a typo, got: ${text}`
+    );
+    assert.ok(
+      !/NOBODY NOTIFIED/.test(text),
+      "a real agent elsewhere is not the same as a nonexistent one"
+    );
+  });
+
+  it("send_message confirms a mention that did reach someone", async () => {
+    const peerId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: peerId, agentName: "present-peer", capabilities: {} }),
+    });
+
+    const res = await client.callTool({
+      name: "send_message",
+      arguments: { content: "@present-peer ping" },
+    });
+    const text = textOf(res);
+    assert.match(text, /notified: present-peer/, `got: ${text}`);
+    assert.ok(!/NOBODY NOTIFIED/.test(text));
+  });
+
   it("send_message resolves dotted agent names in full", async () => {
     const res = await client.callTool({
       name: "send_message",

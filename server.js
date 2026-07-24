@@ -744,7 +744,29 @@ app.post("/api/send", (req, res) => {
         }`
       );
 
-      res.json({ success: true, messageId: message.id, mentions });
+      // Classify mentions. A misspelled name parses perfectly and creates a
+      // notification row addressed to an agent that does not exist, so the
+      // sender sees a successful mention while nobody is ever notified —
+      // "@ar-client-dev" instead of "@client-ar-dev" reads as delivered.
+      // Report which mentions actually reached someone.
+      const notified = [];
+      const elsewhere = [];
+      const unknown = [];
+      for (const name of mentions) {
+        const found = findAgentByName(name);
+        if (!found) unknown.push(name);
+        else if (found.room === agent.room) notified.push(name);
+        else elsewhere.push({ name, room: found.room });
+      }
+
+      res.json({
+        success: true,
+        messageId: message.id,
+        mentions,
+        notified,
+        ...(elsewhere.length ? { elsewhere } : {}),
+        ...(unknown.length ? { unknown } : {}),
+      });
     }
   );
 });
