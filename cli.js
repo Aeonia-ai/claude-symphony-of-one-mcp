@@ -19,6 +19,15 @@ import {
 
 const SERVER_URL = process.env.CHAT_SERVER_URL || "http://localhost:3000";
 
+// The hub guards /api and the socket handshake with a shared token when
+// AUTH_TOKEN is set. Without sending it, every REST call 401s and the socket is
+// rejected — so the CLI was entirely non-functional against a secured hub.
+const AUTH_TOKEN =
+  process.env.AUTH_TOKEN || process.env.SYMPHONY_AUTH_TOKEN || "";
+if (AUTH_TOKEN) {
+  axios.defaults.headers.common["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+}
+
 class OrchestratorCLI {
   constructor() {
     this.socket = null;
@@ -1034,7 +1043,7 @@ class OrchestratorCLI {
   connectSocket() {
     if (this.socket) this.socket.disconnect();
 
-    this.socket = io(SERVER_URL);
+    this.socket = io(SERVER_URL, AUTH_TOKEN ? { auth: { token: AUTH_TOKEN } } : {});
 
     this.socket.on("connect", () => {
       this.socket.emit("register", {

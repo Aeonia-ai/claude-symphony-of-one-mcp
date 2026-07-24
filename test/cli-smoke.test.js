@@ -30,7 +30,11 @@ const CLI_JS = path.resolve(
  * Run cli.js against a hub, feed it lines, and collect its output.
  * Lines are sent with a small delay so each command's async work can land.
  */
-function runCli(serverUrl, lines, { settleMs = 400 } = {}) {
+// settleMs is generous: each CLI line drives a spawned process through a socket
+// connect + REST round-trip, and under the full parallel `npm test` run these
+// compete for CPU with every other file. Too short and the CLI hasn't finished
+// before the next line (or /quit) arrives — a flake, not a real failure.
+function runCli(serverUrl, lines, { settleMs = 800, authToken = "" } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [CLI_JS], {
       env: {
@@ -38,6 +42,7 @@ function runCli(serverUrl, lines, { settleMs = 400 } = {}) {
         CHAT_SERVER_URL: serverUrl,
         SHARED_DIR: path.join(os.tmpdir(), `cli-shared-${randomUUID()}`),
         FORCE_COLOR: "0",
+        ...(authToken ? { AUTH_TOKEN: authToken } : {}),
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -174,6 +179,67 @@ describe("cli.js smoke", () => {
     assert.ok(
       !/ReferenceError|TypeError/.test(stdout + stderr),
       `unknown command crashed the CLI:\n${stderr}`
+    );
+  });
+});
+
+describe("cli.js against a SECURED hub (AUTH_TOKEN set)", () => {
+  // The production hub sets AUTH_TOKEN. The CLI sent no auth, so every REST call
+  // 401'd and the socket was rejected — it was entirely non-functional against a
+  // secured hub. The earlier smoke tests ran in open mode and missed this.
+  const TOKEN = "cli-secure-token";
+  let srv, url;
+  const room = `cli-secure-${randomUUID().slice(0, 6)}`;
+
+  before(async () => {
+    srv = await startServer({ AUTH_TOKEN: TOKEN });
+    url = `http://localhost:${srv.port}`;
+  });
+  after(async () => { await srv.stop(); });
+
+  it("the hub really is secured (unauthenticated calls 401)", async () => {
+    const res = await fetch(`${url}/api/rooms`);
+    assert.equal(res.status, 401, "guard must be active for this test to mean anything");
+  });
+
+  it("joins and sends against the secured hub when given the token", async () => {
+    const marker = `secure-hi-${randomUUID().slice(0, 6)}`;
+    const { stdout, stderr } = await runCli(
+      url,
+      [`/join ${room}`, marker, "/quit"],
+      { authToken: TOKEN }
+    );
+
+    assert.ok(
+      !/401|Unauthorized|Failed to (join|send)/i.test(stdout),
+      `CLI could not operate against the secured hub:\n${stdout}`
+    );
+
+    // The message must actually land — proves the authenticated REST path works.
+    const res = await fetch(`${url}/api/messages/${room}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const body = await res.json();
+    assert.ok(
+      body.messages.map((m) => m.content).includes(marker),
+      "an authenticated CLI send should reach the room"
+    );
+  });
+
+  it("creates a task against the secured hub", async () => {
+    const title = `secure-task-${randomUUID().slice(0, 6)}`;
+    await runCli(
+      url,
+      [`/join ${room}`, "/task create", title, "desc", "", "", "/quit"],
+      { authToken: TOKEN }
+    );
+    const res = await fetch(`${url}/api/tasks/${room}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const body = await res.json();
+    assert.ok(
+      (body.tasks || []).some((t) => t.title.includes(title)),
+      `authenticated CLI task create should reach the hub; got ${JSON.stringify((body.tasks || []).map((t) => t.title))}`
     );
   });
 });
