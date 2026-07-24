@@ -501,9 +501,14 @@ server.registerTool(
     // Label the source room: retrieval is not room-scoped by default, so an
     // unlabelled list made a mention from another room look like it came from
     // the one the agent is working in.
+    // The id must be shown: mark_notification_read takes a notificationId, and
+    // this is the only tool that can supply one. Omitting it left the
+    // unread loop impossible to close, so unread stayed a lifetime tally
+    // rather than a live signal. (Same defect as get_tasks omitting task ids.)
     const notificationList = filtered.map(n => {
       const where = n.room && n.room !== currentRoom ? ` {room: ${n.room}}` : '';
-      return `[${n.type.toUpperCase()}]${where} ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}`;
+      const id = n.id ? `\n  id: ${n.id}` : '';
+      return `[${n.type.toUpperCase()}]${where} ${n.message || (n.task ? n.task.title : 'System notification')} - ${new Date(n.timestamp).toLocaleString()}${n.read ? ' (READ)' : ' (UNREAD)'}${id}`;
     }).join('\n');
 
     const truncated = serverCounts?.hasMore

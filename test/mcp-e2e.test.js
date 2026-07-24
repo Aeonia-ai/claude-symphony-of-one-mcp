@@ -511,6 +511,45 @@ describe("MCP end-to-end", () => {
     assert.match(textOf(res), /done/, "task should report its new status");
   });
 
+  it("closes the mention loop entirely from tool output", async () => {
+    // The read-marking loop must be completable using ONLY what the tools
+    // print: get_notifications has to surface the id that
+    // mark_notification_read requires. Without it the loop is unclosable and
+    // "unread" degrades into a lifetime tally. (Found by dev-coordinator's
+    // self-test run, not by this suite.)
+    const peerId = randomUUID();
+    await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: peerId, agentName: "loop-peer", capabilities: {} }),
+    });
+    await fetch(`http://localhost:${srv.port}/api/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: peerId, content: "@mcp-test-agent close the loop" }),
+    });
+
+    const listed = await client.callTool({
+      name: "get_notifications",
+      arguments: { unreadOnly: true },
+    });
+    const text = textOf(listed);
+
+    const id = text.match(/id: ([0-9a-f-]{36})/)?.[1];
+    assert.ok(
+      id,
+      `get_notifications must print the id mark_notification_read needs; got:\n${text}`
+    );
+
+    // Use ONLY that id — no out-of-band lookup.
+    const marked = await client.callTool({
+      name: "mark_notification_read",
+      arguments: { notificationId: id },
+    });
+    assert.ok(!marked.isError, `mark_notification_read errored: ${textOf(marked)}`);
+    assert.match(textOf(marked), /marked read/);
+  });
+
   it("mark_notification_read clears an unread mention", async () => {
     const outsiderId = randomUUID();
     await fetch(`http://localhost:${srv.port}/api/join/${room}`, {
