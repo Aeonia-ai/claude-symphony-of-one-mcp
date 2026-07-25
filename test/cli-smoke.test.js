@@ -62,9 +62,13 @@ function runCli(serverUrl, lines, { settleMs = 800, authToken = "" } = {}) {
         child.stdin.write(line + "\n");
         await new Promise((r) => setTimeout(r, settleMs));
       }
+      // Give the CLI time to finish its last async command before /quit's
+      // exit — under the full parallel run these processes lag on CPU, and a
+      // too-eager kill truncated the final command (a flake, not a real bug).
+      await new Promise((r) => setTimeout(r, settleMs));
       child.stdin.end();
-      // Backstop in case /quit does not exit.
-      setTimeout(() => child.kill("SIGTERM"), 3000);
+      // Backstop in case /quit does not exit on its own.
+      setTimeout(() => child.kill("SIGTERM"), 6000);
     })();
   });
 }
@@ -180,6 +184,54 @@ describe("cli.js smoke", () => {
       !/ReferenceError|TypeError/.test(stdout + stderr),
       `unknown command crashed the CLI:\n${stderr}`
     );
+  });
+
+  it("/purge deletes messages through the CLI when the room name is typed", async () => {
+    const purgeRoom = `cli-purge-${randomUUID().slice(0, 6)}`;
+    const marker = `purge-me-${randomUUID().slice(0, 6)}`;
+    // Seed a message directly so we know it exists.
+    const aid = randomUUID();
+    await fetch(`${url}/api/join/${purgeRoom}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: aid, agentName: "seed", capabilities: {} }),
+    });
+    await fetch(`${url}/api/send`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: aid, content: marker }),
+    });
+
+    // Drive the CLI: join, /purge, then type the room name to confirm.
+    const { stdout, stderr } = await runCli(url, [
+      `/join ${purgeRoom}`,
+      "/purge",
+      purgeRoom, // confirmation answer
+      "/quit",
+    ]);
+    assert.ok(
+      !/ReferenceError|TypeError/.test(stdout + stderr),
+      `/purge crashed:\n${stderr}`
+    );
+
+    const body = await (await fetch(`${url}/api/messages/${purgeRoom}?limit=1000`)).json();
+    assert.equal(body.matched, 0, `room should be empty after /purge, still has ${body.matched}`);
+  });
+
+  it("/purge without typing the room name does NOT delete", async () => {
+    const room = `cli-nopurge-${randomUUID().slice(0, 6)}`;
+    const aid = randomUUID();
+    await fetch(`${url}/api/join/${room}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: aid, agentName: "seed", capabilities: {} }),
+    });
+    await fetch(`${url}/api/send`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: aid, content: "safe" }),
+    });
+
+    await runCli(url, [`/join ${room}`, "/purge", "wrong-name", "/quit"]);
+
+    const body = await (await fetch(`${url}/api/messages/${room}?limit=1000`)).json();
+    assert.ok(body.matched >= 1, "a mistyped confirmation must not delete anything");
   });
 });
 

@@ -272,6 +272,14 @@ class OrchestratorCLI {
         this.showQuickStart();
         break;
 
+      case "/purge":
+        await this.purgeMessages(args);
+        break;
+
+      case "/delete-room":
+        await this.deleteRoom(args[0]);
+        break;
+
       case "/quit":
       case "/q":
         this.rl.close();
@@ -975,6 +983,8 @@ class OrchestratorCLI {
     console.log(chalk.cyan("\nSystem:"));
     console.log("  /name <name>        - Set your display name");
     console.log("  /clear              - Clear screen");
+    console.log(chalk.red("  /purge              - Delete messages in the current room (confirm required)"));
+    console.log(chalk.red("  /delete-room <room> - Delete a room and all its data (confirm required)"));
     console.log("  /help               - Show this help");
     console.log("  /quit               - Exit");
 
@@ -1272,6 +1282,80 @@ class OrchestratorCLI {
       console.log(chalk.green("✓ Task status updated successfully"));
     } catch (error) {
       console.log(chalk.red(`Failed to update task: ${error.message}`));
+    }
+  }
+
+  // Destructive: clear messages from the current room. Optional args:
+  //   /purge                 clear ALL messages in the room
+  //   /purge before <ISO>    clear messages older than a timestamp
+  //   /purge type <type>     clear only a message type (e.g. system)
+  async purgeMessages(args) {
+    if (!this.currentRoom) {
+      console.log(chalk.yellow("Join a room first (/join <room>)."));
+      return;
+    }
+    const opts = {};
+    if (args[0] === "before" && args[1]) opts.before = args[1];
+    else if (args[0] === "type" && args[1]) opts.type = args[1];
+    else if (args.length) {
+      console.log(chalk.yellow("Usage: /purge  |  /purge before <ISO>  |  /purge type <type>"));
+      return;
+    }
+
+    const scope = opts.before
+      ? `messages older than ${opts.before}`
+      : opts.type
+        ? `messages of type "${opts.type}"`
+        : "ALL messages";
+    const answer = await this.question(
+      chalk.red(`Delete ${scope} in room "${this.currentRoom}"? This cannot be undone. Type the room name to confirm: `)
+    );
+    if (answer.trim() !== this.currentRoom) {
+      console.log(chalk.gray("Cancelled."));
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams({ confirm: "true", ...opts });
+      const res = await axios.delete(
+        `${SERVER_URL}/api/messages/${this.currentRoom}?${params.toString()}`
+      );
+      console.log(chalk.green(`✓ Deleted ${res.data.deleted} message(s).`));
+    } catch (error) {
+      console.log(chalk.red(`Failed to purge: ${error.response?.data?.error || error.message}`));
+    }
+  }
+
+  // Destructive: delete a room and everything in it.
+  async deleteRoom(roomName) {
+    const target = roomName || this.currentRoom;
+    if (!target) {
+      console.log(chalk.yellow("Usage: /delete-room <room>  (or join one first)"));
+      return;
+    }
+    const answer = await this.question(
+      chalk.red(`DELETE room "${target}" and ALL its messages, tasks, notifications and agents? This cannot be undone. Type the room name to confirm: `)
+    );
+    if (answer.trim() !== target) {
+      console.log(chalk.gray("Cancelled."));
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams({ confirm: "true", confirmName: target });
+      const res = await axios.delete(
+        `${SERVER_URL}/api/rooms/${target}?${params.toString()}`
+      );
+      const d = res.data.deleted;
+      console.log(chalk.green(
+        `✓ Deleted room "${target}": ${d.messages} messages, ${d.tasks} tasks, ${d.notifications} notifications, ${d.agents} agents.`
+      ));
+      if (target === this.currentRoom) {
+        this.currentRoom = null;
+        if (this.socket) { this.socket.disconnect(); this.socket = null; }
+      }
+    } catch (error) {
+      console.log(chalk.red(`Failed to delete room: ${error.response?.data?.error || error.message}`));
     }
   }
 

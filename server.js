@@ -1080,6 +1080,104 @@ app.get("/api/rooms", (req, res) => {
   res.json({ rooms: roomList });
 });
 
+// DELETE /api/messages/:room — clear messages from a room, optionally filtered.
+// Irreversible, so it requires an explicit confirm flag. Intended for the CLI
+// (human operator); no MCP tool exposes it. Optional filters make it selective:
+//   ?before=<ISO>  only messages strictly older than this timestamp
+//   ?type=system   only messages of this type (e.g. purge join notices)
+app.delete("/api/messages/:room", (req, res) => {
+  const { room } = req.params;
+  const { before, type } = req.query;
+  const confirm = req.query.confirm === "true" || req.body?.confirm === true;
+
+  if (!confirm) {
+    return res.status(400).json({
+      success: false,
+      error: "Refusing to delete without confirmation. Pass confirm=true.",
+    });
+  }
+  if (before && Number.isNaN(new Date(before).getTime())) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid 'before' timestamp: ${JSON.stringify(before)}`,
+    });
+  }
+
+  const where = ["room = ?"];
+  const params = [room];
+  if (before) { where.push("timestamp < ?"); params.push(new Date(before).toISOString()); }
+  if (type) { where.push("type = ?"); params.push(type); }
+
+  db.run(`DELETE FROM messages WHERE ${where.join(" AND ")}`, params, function (err) {
+    if (err) {
+      logger.error(`Failed to clear messages for ${room}:`, err);
+      return res.status(500).json({ success: false, error: "Database error" });
+    }
+    // Mirror the delete in the in-memory buffer.
+    const buf = messages.get(room);
+    if (buf) {
+      const beforeMs = before ? new Date(before).getTime() : null;
+      messages.set(
+        room,
+        buf.filter((m) => {
+          const matches =
+            (beforeMs === null || new Date(m.timestamp).getTime() < beforeMs) &&
+            (!type || m.type === type);
+          return !matches; // keep everything that did NOT match the filters
+        })
+      );
+    }
+    logger.warn(
+      `Cleared ${this.changes} messages from room ${room}` +
+        (before ? ` before ${before}` : "") + (type ? ` of type ${type}` : "")
+    );
+    res.json({ success: true, deleted: this.changes });
+  });
+});
+
+// DELETE /api/rooms/:room — delete a room and ALL its data. Requires confirm=true
+// AND confirmName matching the room, so a single stray call can't trigger it.
+app.delete("/api/rooms/:room", (req, res) => {
+  const { room } = req.params;
+  const confirm = req.query.confirm === "true" || req.body?.confirm === true;
+  const confirmName = req.query.confirmName || req.body?.confirmName;
+
+  if (!confirm || confirmName !== room) {
+    return res.status(400).json({
+      success: false,
+      error: `Refusing to delete room. Pass confirm=true and confirmName="${room}".`,
+    });
+  }
+
+  const counts = {};
+  db.serialize(() => {
+    db.run("DELETE FROM messages WHERE room = ?", [room], function () { counts.messages = this.changes; });
+    db.run("DELETE FROM tasks WHERE room = ?", [room], function () { counts.tasks = this.changes; });
+    db.run("DELETE FROM notifications WHERE room = ?", [room], function () { counts.notifications = this.changes; });
+    db.run("DELETE FROM agents WHERE room = ?", [room], function () { counts.agents = this.changes; });
+    db.run("DELETE FROM rooms WHERE name = ?", [room], function (err) {
+      if (err) {
+        logger.error(`Failed to delete room ${room}:`, err);
+        return res.status(500).json({ success: false, error: "Database error" });
+      }
+      counts.room = this.changes;
+
+      // Purge in-memory state.
+      for (const [id, a] of agents) if (a.room === room) agents.delete(id);
+      for (const [id, t] of tasks) if (t.room === room) tasks.delete(id);
+      rooms.delete(room);
+      messages.delete(room);
+      lastIssuedTs.delete(room);
+      pendingTs.delete(room);
+      const watcher = fileWatcher.get(room);
+      if (watcher) { try { watcher.close(); } catch {} fileWatcher.delete(room); }
+
+      logger.warn(`Deleted room ${room}: ${JSON.stringify(counts)}`);
+      res.json({ success: true, deleted: counts });
+    });
+  });
+});
+
 app.get("/api/agents/:room", (req, res) => {
   const { room: roomName } = req.params;
   const room = rooms.get(roomName);
