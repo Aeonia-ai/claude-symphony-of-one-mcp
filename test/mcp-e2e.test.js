@@ -185,10 +185,23 @@ describe("MCP end-to-end", () => {
 
     assert.match(
       text,
-      /Retrieved 5 of 12 matching messages/,
+      /OLDEST 5 of 12/,
       `truncation must report the true window size, got: ${text}`
     );
-    assert.match(text, /TRUNCATED/, "truncation must be called out explicitly");
+    assert.match(text, /INCOMPLETE/, "truncation must be called out explicitly");
+    // The direction must be correct: a `since` page holds back the NEWER
+    // messages, not older ones. Reporting "older not shown" here sent a real
+    // agent the wrong way — it thought it had the recent state when it had the
+    // oldest page and was missing everything current.
+    assert.match(
+      text,
+      /NEWER messages.*NOT shown/,
+      `since-truncation must say the NEWER messages are missing, got: ${text}`
+    );
+    assert.ok(
+      !/older ones not shown/i.test(text),
+      "must not claim older messages are missing on a since query"
+    );
     assert.match(
       text,
       /after-0/,

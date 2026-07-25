@@ -403,12 +403,21 @@ server.registerTool(
         };
       }
 
+      // Truncation wording must match the paging DIRECTION. A `since` query
+      // returns the OLDEST unseen page and holds back the NEWER ones, so "older
+      // not shown" is exactly backwards there — the missing messages are the
+      // recent ones, including whatever just happened. A no-`since` query
+      // returns the newest tail, so the missing ones are genuinely older.
+      const notShown = matched - messages.length;
       const header =
         hasMore && typeof matched === "number"
-            ? `Retrieved ${messages.length} of ${matched} matching messages ` +
-              `(TRUNCATED — ${matched - messages.length} older ones not shown; ` +
-              `poll again with the cursor below to continue, or raise 'limit')`
-            : `Retrieved ${messages.length} messages from server`;
+          ? params.since
+            ? `Retrieved the OLDEST ${messages.length} of ${matched} messages after your cursor. ` +
+              `⚠ INCOMPLETE — ${notShown} NEWER messages (the most recent, including anything just posted) are NOT shown. ` +
+              `You do NOT have the current state. Poll again with the cursor below, repeating until a page returns with no TRUNCATED marker, BEFORE acting or summarizing. Or re-request with a higher 'limit'.`
+            : `Retrieved the ${messages.length} most recent of ${matched} messages. ` +
+              `⚠ INCOMPLETE — ${notShown} OLDER messages are not shown. Raise 'limit' or page back if you need them.`
+          : `Retrieved ${messages.length} messages from server`;
 
       return {
         content: [
