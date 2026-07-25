@@ -725,6 +725,13 @@ app.post("/api/join/:room", (req, res) => {
   const { room: roomName } = req.params;
   const { agentId, agentName, capabilities = {} } = req.body;
 
+  // Is this name ALREADY in the room? If so this is a re-join (agents get a
+  // fresh id every session), not a genuine arrival, and we suppress the
+  // "has joined" announcement. Autonomous workers re-join every cycle and
+  // never leave, so without this those notices were the single largest source
+  // of room noise — 41% of messages in one active room. Check BEFORE mutating.
+  const isRejoin = findAgentsByName(agentName).some((a) => a.room === roomName);
+
   const room = getRoom(roomName);
   room.agents.add(agentId);
 
@@ -759,40 +766,45 @@ app.post("/api/join/:room", (req, res) => {
     `agent upsert ${agentName}`
   );
 
-  const joinMessage = {
-    id: uuidv4(),
-    type: "system",
-    agentId: null,
-    agentName: "System",
-    content: `${agentName} has joined the room`,
-    timestamp: nextTimestamp(roomName),
-    room: roomName,
-    mentions: [],
-    metadata: { type: "join" },
-  };
+  // Announce only genuine first arrivals, not every session re-join.
+  if (!isRejoin) {
+    const joinMessage = {
+      id: uuidv4(),
+      type: "system",
+      agentId: null,
+      agentName: "System",
+      content: `${agentName} has joined the room`,
+      timestamp: nextTimestamp(roomName),
+      room: roomName,
+      mentions: [],
+      metadata: { type: "join" },
+    };
 
-  recordMessage(roomName, joinMessage);
+    recordMessage(roomName, joinMessage);
 
-  // Persist message to database
-  dbRun(
-    "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [
-      joinMessage.id,
-      roomName,
-      null,
-      "System",
-      joinMessage.content,
-      joinMessage.type,
-      JSON.stringify(joinMessage.mentions),
-      JSON.stringify(joinMessage.metadata),
-      joinMessage.timestamp,
-    ],
-    `join message for ${roomName}`
+    // Persist message to database
+    dbRun(
+      "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        joinMessage.id,
+        roomName,
+        null,
+        "System",
+        joinMessage.content,
+        joinMessage.type,
+        JSON.stringify(joinMessage.mentions),
+        JSON.stringify(joinMessage.metadata),
+        joinMessage.timestamp,
+      ],
+      `join message for ${roomName}`
+    );
+
+    io.to(roomName).emit("message", joinMessage);
+  }
+
+  logger.info(
+    `Agent ${agentName} (${agentId}) ${isRejoin ? "re-joined" : "joined"} room ${roomName}`
   );
-
-  io.to(roomName).emit("message", joinMessage);
-
-  logger.info(`Agent ${agentName} (${agentId}) joined room ${roomName}`);
 
   res.json({
     success: true,
