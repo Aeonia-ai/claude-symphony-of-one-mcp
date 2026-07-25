@@ -993,9 +993,15 @@ function buildMessagesResponse(res, roomMessages, since, max) {
   });
 }
 
+// Does a message @mention this name (case-insensitive)?
+function mentionsName(m, name) {
+  const lower = name.toLowerCase();
+  return Array.isArray(m.mentions) && m.mentions.some((x) => String(x).toLowerCase() === lower);
+}
+
 app.get("/api/messages/:room", (req, res) => {
   const { room } = req.params;
-  const { since, limit = 100 } = req.query;
+  const { since, limit = 100, mentioning } = req.query;
 
   let sinceTime = null;
   if (since) {
@@ -1048,6 +1054,9 @@ app.get("/api/messages/:room", (req, res) => {
     let rows = inMem;
     if (since) rows = rows.filter((m) => new Date(m.timestamp).getTime() > sinceTime);
     rows = rows.filter((m) => new Date(m.timestamp).getTime() <= safeTs);
+    // `mentioning` returns only messages that @mention this name — the
+    // "just what's directed to me" stream, full content, cursor-driven.
+    if (mentioning) rows = rows.filter((m) => mentionsName(m, mentioning));
     return buildMessagesResponse(res, rows, since, max);
   }
 
@@ -1059,9 +1068,10 @@ app.get("/api/messages/:room", (req, res) => {
         logger.error(`Failed to read messages for room ${room}:`, err);
         return res.status(500).json({ success: false, error: "Database error" });
       }
-      const rows = dbRows
+      let rows = dbRows
         .map(rowToMessage)
         .filter((m) => new Date(m.timestamp).getTime() <= safeTs);
+      if (mentioning) rows = rows.filter((m) => mentionsName(m, mentioning));
       return buildMessagesResponse(res, rows, since, max);
     }
   );

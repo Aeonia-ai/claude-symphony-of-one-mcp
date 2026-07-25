@@ -153,9 +153,9 @@ export default class SocketIoHubTransport extends Transport {
    * @param {string|undefined} since
    * @param {number} limit
    */
-  async getMessages(room, since, limit) {
+  async getMessages(room, since, limit, mentioning) {
     return this._axios.get(`/api/messages/${room}`, {
-      params: { since, limit },
+      params: { since, limit, mentioning: mentioning || undefined },
     });
   }
 

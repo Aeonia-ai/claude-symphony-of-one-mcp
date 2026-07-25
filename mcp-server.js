@@ -322,9 +322,12 @@ server.registerTool(
       "no arguments, then reuse the 'Next poll: since=<ISO>' cursor printed at " +
       "the end of the output as the `since` argument on every later call — you " +
       "then receive only new messages. Pass limit:0 with `since` to get just " +
-      "the COUNT of new messages without transferring any. Do NOT build a " +
-      "`since` value from the displayed [3:04:12 PM] times; they are local " +
-      "clock times, not valid timestamps, and will be rejected.",
+      "the COUNT of new messages without transferring any. Set directedToMe:true " +
+      "to receive ONLY the messages that @mention you (full content) — combine " +
+      "with the cursor to poll exactly the new messages addressed to you, and " +
+      "with limit:0 to just count them. Do NOT build a `since` value from the " +
+      "displayed [3:04:12 PM] times; they are local clock times, not valid " +
+      "timestamps, and will be rejected.",
     inputSchema: {
       since: z.string().optional().describe(
         "Full ISO 8601 timestamp to get messages after, e.g. 2026-07-23T21:00:00.000Z. " +
@@ -335,6 +338,11 @@ server.registerTool(
         "Maximum number of messages (default: 50). Use 0 with `since` to get " +
         "only the COUNT of new messages without transferring any of them; the " +
         "response still reports how many matched."
+      ),
+      directedToMe: z.boolean().optional().describe(
+        "If true, return ONLY messages that @mention you — the full messages " +
+        "addressed to you, not the room firehose. Composes with `since` (new " +
+        "ones only) and limit:0 (count only)."
       ),
     },
   },
@@ -374,7 +382,8 @@ server.registerTool(
       const response = await transport.getMessages(
         currentRoom,
         params.since,
-        params.limit ?? 50
+        params.limit ?? 50,
+        params.directedToMe ? agentName : undefined
       );
 
       const messages = response.data.messages;
