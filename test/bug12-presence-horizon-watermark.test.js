@@ -41,7 +41,9 @@ describe("Bug 12a – mention classification across rooms + reaping", () => {
     }).then((r) => r.json());
 
   before(async () => {
-    srv = await startServer();
+    // Window 0 => nothing counts as "live", so reaping is aggressive and
+    // deterministic for these classification/reap assertions.
+    srv = await startServer({ LIVE_AGENT_WINDOW_MS: "0" });
     base = `http://localhost:${srv.port}`;
   });
   after(async () => {
@@ -85,6 +87,55 @@ describe("Bug 12a – mention classification across rooms + reaping", () => {
     const body = await (await fetch(`${base}/api/agents/${room}`)).json();
     const count = body.agents.filter((a) => a.name === "rejoiner").length;
     assert.equal(count, 1, `expected 1 rejoiner row, got ${count}`);
+  });
+});
+
+describe("Bug 12d – reaping never drops a live session; drops are self-describing", () => {
+  let srv, base;
+  const room = "live-room";
+
+  const join = (id, name) =>
+    fetch(`${base}/api/join/${room}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: id, agentName: name, capabilities: {} }),
+    });
+  const send = (id, content) =>
+    fetch(`${base}/api/send`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: id, content }),
+    });
+
+  before(async () => {
+    // Default (large) live window so a just-active session counts as live.
+    srv = await startServer({ LIVE_AGENT_WINDOW_MS: "120000" });
+    base = `http://localhost:${srv.port}`;
+  });
+  after(async () => { await srv.stop(); });
+
+  it("a same-name rejoin does NOT evict a still-active older session", async () => {
+    const older = randomUUID();
+    await join(older, "worker");
+    // The older session is active: it just sent.
+    const s1 = await send(older, "older still working");
+    assert.equal(s1.status, 200);
+
+    // A new session joins under the SAME name+room (fresh id).
+    await join(randomUUID(), "worker");
+
+    // The older session must still be registered — not silently dropped.
+    const s2 = await send(older, "older still alive after the rejoin");
+    assert.equal(
+      s2.status, 200,
+      "a live older session must survive a same-name rejoin, not get reaped"
+    );
+  });
+
+  it("a genuinely unregistered send gets an actionable, coded error", async () => {
+    const res = await send(randomUUID(), "who am i");
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.equal(body.code, "AGENT_NOT_REGISTERED", `got ${JSON.stringify(body)}`);
+    assert.match(body.error, /room_join/, "must tell the agent how to recover");
   });
 });
 

@@ -600,14 +600,35 @@ function classifyMention(name, room) {
   return { kind: "elsewhere", name, rooms };
 }
 
-// Drop any prior records for the same (name, room) held under a DIFFERENT agent
-// id. Agents regenerate their id every session, so without this each rejoin
-// leaves a stale "active" row, inflating presence and corrupting mention
-// classification. Keeps one record per (name, room): the current one.
+// A record is "live" if it acted within this window. Reaping only removes
+// STALE duplicates so a new join never silently evicts a session that is still
+// polling under a different id — that would drop a live agent, discoverable
+// only when its next call 404s.
+const LIVE_AGENT_WINDOW_MS = parseInt(
+  process.env.LIVE_AGENT_WINDOW_MS || String(2 * 60 * 1000),
+  10
+);
+
+function isLiveAgent(a) {
+  if (!a.lastActive) return false;
+  const t = new Date(a.lastActive).getTime();
+  return Number.isFinite(t) && Date.now() - t < LIVE_AGENT_WINDOW_MS;
+}
+
+// Drop STALE prior records for the same (name, room) held under a different
+// agent id. Agents regenerate their id every session, so without this each
+// rejoin leaves a dead "active" row, inflating presence and corrupting mention
+// classification. A record that acted in the last couple of minutes is left
+// alone — evicting a live session is worse than an extra presence row.
 function reapDuplicateAgents(keepId, name, room) {
   const lower = name.toLowerCase();
   for (const [id, a] of agents) {
-    if (id !== keepId && a.room === room && a.name.toLowerCase() === lower) {
+    if (
+      id !== keepId &&
+      a.room === room &&
+      a.name.toLowerCase() === lower &&
+      !isLiveAgent(a)
+    ) {
       agents.delete(id);
       const r = rooms.get(room);
       if (r) r.agents.delete(id);
@@ -786,7 +807,7 @@ app.post("/api/leave/:agentId", (req, res) => {
   const agent = agents.get(agentId);
 
   if (!agent) {
-    return res.status(404).json({ success: false, error: "Agent not found" });
+    return res.status(404).json({ success: false, error: "Agent not registered — your session may have been replaced by a newer one or cleared on a restart. Call room_join to re-register, then retry.", code: "AGENT_NOT_REGISTERED" });
   }
 
   const room = rooms.get(agent.room);
@@ -818,7 +839,7 @@ app.post("/api/send", (req, res) => {
   const agent = agents.get(agentId);
 
   if (!agent) {
-    return res.status(404).json({ success: false, error: "Agent not found" });
+    return res.status(404).json({ success: false, error: "Agent not registered — your session may have been replaced by a newer one or cleared on a restart. Call room_join to re-register, then retry.", code: "AGENT_NOT_REGISTERED" });
   }
 
   // Parse mentions from content
@@ -1236,7 +1257,7 @@ app.post("/api/memory/:agentId", (req, res) => {
 
   const agent = agents.get(agentId);
   if (!agent) {
-    return res.status(404).json({ success: false, error: "Agent not found" });
+    return res.status(404).json({ success: false, error: "Agent not registered — your session may have been replaced by a newer one or cleared on a restart. Call room_join to re-register, then retry.", code: "AGENT_NOT_REGISTERED" });
   }
 
   const memoryId = uuidv4();
