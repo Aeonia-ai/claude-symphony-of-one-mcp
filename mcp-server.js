@@ -50,7 +50,17 @@ function fmtLocal(ts) {
  * message lines use local time for readability, which is NOT valid `since`
  * input — this cursor is what agents should feed back.
  */
-function formatCursor(messages) {
+function formatCursor(messages, nextSince) {
+  // Prefer the server's cursor. It is authoritative: the server owns the clock
+  // that stamps messages, and it still returns a cursor when the page is EMPTY
+  // (echoing the caller's own `since` back). Deriving the cursor only from
+  // returned messages meant a quiet poll printed no cursor at all, so the agent
+  // had nothing to carry forward and fell back to a no-`since` poll — re-reading
+  // the whole room tail with no way to tell which messages were new. That is
+  // the "can't find new messages" failure, and it hit on every empty poll.
+  if (nextSince) return `\n\nNext poll: since=${nextSince}`;
+
+  // Fallback for a server predating `nextSince`.
   if (!messages.length) return "";
   const newest = messages.reduce(
     (a, m) => (new Date(m.timestamp) > new Date(a.timestamp) ? m : a)
@@ -387,7 +397,7 @@ server.registerTool(
       );
 
       const messages = response.data.messages;
-      const { matched, hasMore } = response.data;
+      const { matched, hasMore, nextSince } = response.data;
 
       // Never report a truncated page as if it were the whole window — that is
       // the same silent under-report the `since` filter used to produce.
@@ -404,9 +414,13 @@ server.registerTool(
           content: [
             {
               type: "text",
+              // Echo the cursor here too. A count-only poll used to return no
+              // cursor at all, so an agent that used limit:0 to check "is there
+              // anything new?" lost its place on every check.
               text:
                 `${matched} new message(s) — count only, none fetched` +
-                (rows ? `\n\nBy agent:\n${rows}` : ""),
+                (rows ? `\n\nBy agent:\n${rows}` : "") +
+                formatCursor([], nextSince),
             },
           ],
         };
@@ -428,11 +442,29 @@ server.registerTool(
               `⚠ INCOMPLETE — ${notShown} OLDER messages are not shown. Raise 'limit' or page back if you need them.`
           : `Retrieved ${messages.length} messages from server`;
 
+      // An empty page is a normal, expected result — say so plainly and still
+      // hand back the cursor, rather than rendering "Retrieved 0 messages:"
+      // followed by nothing, which reads like a failure and used to leave the
+      // agent with no cursor to poll again with.
+      if (!messages.length) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `No new messages${params.since ? " since your cursor" : " in this room"}` +
+                (params.directedToMe ? " addressed to you" : "") +
+                `.${formatCursor([], nextSince)}`,
+            },
+          ],
+        };
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: `${header}:\n\n${messages.map(m => `[${fmtLocal(m.timestamp)}] ${m.agentName}: ${m.content}`).join('\n')}${formatCursor(messages)}`
+            text: `${header}:\n\n${messages.map(m => `[${fmtLocal(m.timestamp)}] ${m.agentName}: ${m.content}`).join('\n')}${formatCursor(messages, nextSince)}`
           }
         ]
       };

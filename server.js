@@ -285,7 +285,16 @@ function safeWatermark(room) {
 // messages stay on disk and are served by the /api/messages DB fallback.
 function recordMessage(room, message) {
   const arr = messages.get(room);
-  if (!arr) return;
+  if (!arr) {
+    // Previously a bare `return` — the message was dropped and the caller
+    // still answered {success: true}. /api/broadcast hit this on every room
+    // that had not been created yet. Callers must call getRoom() first; if one
+    // does not, say so rather than losing the message quietly.
+    logger.error(
+      `recordMessage: no buffer for room "${room}" — message ${message.id} (${message.type}) dropped. Call getRoom() before recording.`
+    );
+    return;
+  }
   arr.push(message);
   const overflow = arr.length - MESSAGE_HISTORY_LIMIT;
   if (overflow > 0) arr.splice(0, overflow);
@@ -325,6 +334,79 @@ function safeJsonParse(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Human-readable type name for validation errors, so a rejected request says
+ * what it actually received rather than just "invalid".
+ */
+function typeName(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
+ * Validate a required string field.
+ *
+ * Untyped bodies used to flow straight through: `content` could be an object,
+ * `agentId` could be absent. Nothing rejected them, so the row was written with
+ * a coerced or NULL value and the caller was told it succeeded. Worse, a
+ * non-string `content` carrying an @mention reached
+ * `message.content.substring()` inside a db.run callback — a TypeError with no
+ * try/catch around it, which is an uncaught exception, which kills the process.
+ * One malformed message from one buggy agent took down the whole hub.
+ *
+ * @returns {string|null} an error message, or null when the value is valid.
+ */
+function invalidString(value, field, maxLength = 100000) {
+  if (typeof value !== "string") {
+    return `'${field}' is required and must be a string (received ${typeName(value)}).`;
+  }
+  if (value.trim() === "") {
+    return `'${field}' is required and must not be empty or whitespace-only.`;
+  }
+  if (value.length > maxLength) {
+    return `'${field}' is ${value.length} characters, which exceeds the ${maxLength} character limit.`;
+  }
+  return null;
+}
+
+// Every column of a `messages` row, in insert order.
+const MESSAGE_INSERT_SQL =
+  "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+function messageInsertParams(m) {
+  return [
+    m.id,
+    m.room,
+    m.agentId ?? null,
+    m.agentName ?? null,
+    m.content,
+    m.type,
+    JSON.stringify(m.mentions || []),
+    JSON.stringify(m.metadata || {}),
+    m.timestamp,
+  ];
+}
+
+/**
+ * The single place a message row is written.
+ *
+ * Anything an agent can read back MUST go through here. Broadcasts, leave
+ * notices and file-change events were only ever pushed to the in-memory buffer,
+ * so they vanished on restart AND were missing from the DB-fallback read path
+ * (a `since` reaching past the in-memory horizon). That leaves a hole in the
+ * middle of history that reads exactly like a quiet period — the caller has no
+ * way to tell "nothing was said" from "the record was never kept".
+ */
+function persistMessage(m, cb) {
+  db.run(MESSAGE_INSERT_SQL, messageInsertParams(m), cb);
+}
+
+// Same write, for messages with no caller waiting on the result.
+function persistMessageAsync(m, context) {
+  dbRun(MESSAGE_INSERT_SQL, messageInsertParams(m), context);
 }
 
 // Map a `messages` DB row to the in-memory message shape used by
@@ -526,6 +608,10 @@ function parseMentions(content) {
 
 // Create notifications for mentioned agents
 async function createNotifications(message, mentions) {
+  // String() defensively: /api/send now rejects non-string content, but this
+  // helper is reachable from other call sites and a TypeError here lands in a
+  // db.run callback with nothing to catch it — i.e. it kills the process.
+  const preview = String(message.content ?? "").substring(0, 100);
   const notifications = mentions.map((mentionedName) => {
     const agent = findAgentByName(mentionedName);
     return {
@@ -533,7 +619,7 @@ async function createNotifications(message, mentions) {
       agent_id: agent?.id || null,
       agent_name: mentionedName,
       room: message.room,
-      message: `${message.agentName} mentioned you: ${message.content.substring(0, 100)}...`,
+      message: `${message.agentName} mentioned you: ${preview}...`,
       type: "mention",
       created_at: new Date().toISOString(),
     };
@@ -646,50 +732,34 @@ function setupFileWatcher(roomName) {
     persistent: true,
   });
 
-  watcher.on("change", (filePath) => {
+  // File-change events are messages like any other: they appear in the room
+  // stream, so they must be written to the same table. Previously they lived
+  // only in the in-memory buffer, which left the same hole as broadcasts —
+  // present in a normal read, missing from the DB-fallback read and after a
+  // restart. nextTimestamp keeps them on the room's cursor sequence so a
+  // poller cannot have already moved past them.
+  const emitFileChange = (action, verb, filePath) => {
     const relativePath = path.relative(SHARED_DIR, filePath);
     const message = {
       id: uuidv4(),
       type: "file_change",
-      content: `File modified: ${relativePath}`,
-      timestamp: new Date().toISOString(),
+      agentId: null,
+      agentName: "System",
+      content: `File ${verb}: ${relativePath}`,
+      mentions: [],
+      metadata: { filePath: relativePath, action },
+      timestamp: nextTimestamp(roomName),
       room: roomName,
-      metadata: { filePath: relativePath, action: "change" },
     };
 
     recordMessage(roomName, message);
+    persistMessageAsync(message, `file_change ${action} in ${roomName}`);
     io.to(roomName).emit("message", message);
-  });
+  };
 
-  watcher.on("add", (filePath) => {
-    const relativePath = path.relative(SHARED_DIR, filePath);
-    const message = {
-      id: uuidv4(),
-      type: "file_change",
-      content: `File created: ${relativePath}`,
-      timestamp: new Date().toISOString(),
-      room: roomName,
-      metadata: { filePath: relativePath, action: "add" },
-    };
-
-    recordMessage(roomName, message);
-    io.to(roomName).emit("message", message);
-  });
-
-  watcher.on("unlink", (filePath) => {
-    const relativePath = path.relative(SHARED_DIR, filePath);
-    const message = {
-      id: uuidv4(),
-      type: "file_change",
-      content: `File deleted: ${relativePath}`,
-      timestamp: new Date().toISOString(),
-      room: roomName,
-      metadata: { filePath: relativePath, action: "delete" },
-    };
-
-    recordMessage(roomName, message);
-    io.to(roomName).emit("message", message);
-  });
+  watcher.on("change", (f) => emitFileChange("change", "modified", f));
+  watcher.on("add", (f) => emitFileChange("add", "created", f));
+  watcher.on("unlink", (f) => emitFileChange("delete", "deleted", f));
 
   fileWatcher.set(roomName, watcher);
 }
@@ -724,6 +794,20 @@ function getRoom(roomName) {
 app.post("/api/join/:room", (req, res) => {
   const { room: roomName } = req.params;
   const { agentId, agentName, capabilities = {} } = req.body;
+
+  // Reject a join that cannot produce a usable agent record. Without this an
+  // absent agentId registered an agent under the key `undefined` and answered
+  // 200, so the caller believed it had joined; every later /api/send from a
+  // client with the same bug then posted as that one shared ghost agent.
+  const idError = invalidString(agentId, "agentId", 200);
+  const nameError = invalidString(agentName, "agentName", 200);
+  if (idError || nameError) {
+    return res.status(400).json({
+      success: false,
+      error: idError || nameError,
+      code: "INVALID_ARGUMENT",
+    });
+  }
 
   // Is this name ALREADY in the room? If so this is a re-join (agents get a
   // fresh id every session), not a genuine arrival, and we suppress the
@@ -781,24 +865,7 @@ app.post("/api/join/:room", (req, res) => {
     };
 
     recordMessage(roomName, joinMessage);
-
-    // Persist message to database
-    dbRun(
-      "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [
-        joinMessage.id,
-        roomName,
-        null,
-        "System",
-        joinMessage.content,
-        joinMessage.type,
-        JSON.stringify(joinMessage.mentions),
-        JSON.stringify(joinMessage.metadata),
-        joinMessage.timestamp,
-      ],
-      `join message for ${roomName}`
-    );
-
+    persistMessageAsync(joinMessage, `join message for ${roomName}`);
     io.to(roomName).emit("message", joinMessage);
   }
 
@@ -829,12 +896,23 @@ app.post("/api/leave/:agentId", (req, res) => {
     const leaveMessage = {
       id: uuidv4(),
       type: "system",
+      agentId: null,
+      agentName: "System",
       content: `${agent.name} has left the room`,
-      timestamp: new Date().toISOString(),
+      mentions: [],
+      metadata: { type: "leave" },
+      // nextTimestamp, not wall-clock: under burst the room's cursor counter
+      // can already be ahead of Date.now(), and a leave notice stamped behind
+      // a poller's cursor is never delivered to it.
+      timestamp: nextTimestamp(agent.room),
       room: agent.room,
     };
 
     recordMessage(agent.room, leaveMessage);
+    // Join notices were persisted and leave notices were not, so after a
+    // restart every departure had been erased and the room read as though
+    // those agents were still present.
+    persistMessageAsync(leaveMessage, `leave message for ${agent.room}`);
     io.to(agent.room).emit("message", leaveMessage);
   }
 
@@ -848,6 +926,19 @@ app.post("/api/leave/:agentId", (req, res) => {
 
 app.post("/api/send", (req, res) => {
   const { agentId, content, metadata = {} } = req.body;
+
+  // Validate BEFORE any lookup or write. A non-string `content` used to be
+  // accepted, stored coerced, and — if it stringified to something containing
+  // an @mention — thrown a TypeError inside a db.run callback, which is
+  // uncaught and terminates the process. A single malformed send took the hub
+  // down for every agent.
+  const contentError = invalidString(content, "content");
+  if (contentError) {
+    return res
+      .status(400)
+      .json({ success: false, error: contentError, code: "INVALID_ARGUMENT" });
+  }
+
   const agent = agents.get(agentId);
 
   if (!agent) {
@@ -877,19 +968,8 @@ app.post("/api/send", (req, res) => {
   // 200 both happened regardless of the write, so a failed INSERT meant every
   // other agent saw a message that would not survive a restart, and the sender
   // was told it succeeded.
-  db.run(
-    "INSERT INTO messages (id, room, agent_id, agent_name, content, type, mentions, metadata, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [
-      message.id,
-      agent.room,
-      agentId,
-      agent.name,
-      content,
-      message.type,
-      JSON.stringify(mentions),
-      JSON.stringify(metadata),
-      message.timestamp,
-    ],
+  persistMessage(
+    message,
     function (err) {
       releasePending(agent.room, pendingMs);
       if (err) {
@@ -952,8 +1032,51 @@ app.post("/api/send", (req, res) => {
   );
 });
 
+/**
+ * The cursor the caller should send as `since` on its next poll.
+ *
+ * Clients used to derive this themselves from the returned page, which meant a
+ * poll that returned NOTHING produced no cursor at all — and an empty poll is
+ * exactly when a client most needs one. An agent that lost its cursor fell back
+ * to a no-`since` poll, which re-reads the whole room tail with no way to tell
+ * which messages are new. In a normally-paced room most polls are empty, so
+ * this was the common case, not the edge case.
+ *
+ * Computed server-side because the server owns the clock that stamps messages;
+ * a client substituting its own `Date.now()` would skip messages whenever its
+ * clock ran ahead of the hub's.
+ *
+ *  - page has messages  -> the newest one in the page (walk forward)
+ *  - empty, had a since -> that same since, unchanged (nothing new happened)
+ *  - count-only with matches -> undefined; the caller has seen no bodies yet
+ *    and must not advance past them
+ *  - genuinely nothing anywhere -> now, i.e. "start watching from here",
+ *    but never past an in-flight write (see below)
+ *
+ * `safeTs` is the in-flight write watermark. The "start from now" case must
+ * respect it: a message whose timestamp is reserved but whose row has not
+ * landed yet is correctly excluded from this page, so handing back a cursor at
+ * `now` would put it BEHIND the caller's cursor and skip it permanently once
+ * it settles. The other branches are already safe — a page message is at or
+ * below the watermark by construction, and `since` came from an earlier page,
+ * which was too. Only this fallback can outrun a pending write.
+ */
+function nextSinceCursor(page, roomMessages, since, safeTs = Infinity) {
+  if (page.length) {
+    const newest = page.reduce((a, m) =>
+      new Date(m.timestamp) > new Date(a.timestamp) ? m : a
+    );
+    return newest.timestamp;
+  }
+  if (since) return since;
+  if (roomMessages.length) return undefined;
+  return new Date(Math.min(Date.now(), safeTs)).toISOString();
+}
+
 // Build the paged /api/messages response from an already sorted+filtered set.
-function buildMessagesResponse(res, roomMessages, since, max) {
+// `safeTs` is the in-flight write watermark, so the cursor cannot outrun a
+// message that is reserved but not yet committed.
+function buildMessagesResponse(res, roomMessages, since, max, safeTs) {
   const matched = roomMessages.length;
 
   // Truncation direction matters.
@@ -982,6 +1105,8 @@ function buildMessagesResponse(res, roomMessages, since, max) {
     }
   }
 
+  const nextSince = nextSinceCursor(page, roomMessages, since, safeTs);
+
   res.json({
     messages: page,
     // `matched` is the full size of the window before truncation, so callers
@@ -989,6 +1114,9 @@ function buildMessagesResponse(res, roomMessages, since, max) {
     matched,
     returned: page.length,
     hasMore: page.length < matched,
+    // Always present when the caller can safely advance — including on an
+    // empty result, where it echoes the incoming cursor back unchanged.
+    ...(nextSince ? { nextSince } : {}),
     ...(byAgent ? { byAgent } : {}),
   });
 }
@@ -1057,7 +1185,7 @@ app.get("/api/messages/:room", (req, res) => {
     // `mentioning` returns only messages that @mention this name — the
     // "just what's directed to me" stream, full content, cursor-driven.
     if (mentioning) rows = rows.filter((m) => mentionsName(m, mentioning));
-    return buildMessagesResponse(res, rows, since, max);
+    return buildMessagesResponse(res, rows, since, max, safeTs);
   }
 
   db.all(
@@ -1072,7 +1200,7 @@ app.get("/api/messages/:room", (req, res) => {
         .map(rowToMessage)
         .filter((m) => new Date(m.timestamp).getTime() <= safeTs);
       if (mentioning) rows = rows.filter((m) => mentionsName(m, mentioning));
-      return buildMessagesResponse(res, rows, since, max);
+      return buildMessagesResponse(res, rows, since, max, safeTs);
     }
   );
 });
@@ -1214,6 +1342,19 @@ app.post("/api/tasks", (req, res) => {
     priority = "medium",
   } = req.body;
 
+  // A task with no room is unreachable: GET /api/tasks/:room filters by room,
+  // so a task created with roomName undefined is stored, counted in /api/stats,
+  // and listed by nothing. The creator was told it succeeded.
+  const roomError = invalidString(roomName, "roomName", 200);
+  const titleError = invalidString(title, "title", 500);
+  if (roomError || titleError) {
+    return res.status(400).json({
+      success: false,
+      error: roomError || titleError,
+      code: "INVALID_ARGUMENT",
+    });
+  }
+
   const task = {
     id: uuidv4(),
     room: roomName,
@@ -1318,19 +1459,58 @@ app.post("/api/broadcast/:room", (req, res) => {
   const { room: roomName } = req.params;
   const { content, from = "Orchestrator" } = req.body;
 
+  const contentError = invalidString(content, "content");
+  if (contentError) {
+    return res
+      .status(400)
+      .json({ success: false, error: contentError, code: "INVALID_ARGUMENT" });
+  }
+  const fromError = invalidString(from, "from", 200);
+  if (fromError) {
+    return res
+      .status(400)
+      .json({ success: false, error: fromError, code: "INVALID_ARGUMENT" });
+  }
+
+  // Create the room if it does not exist yet. Without this, broadcasting to a
+  // room nobody had joined found no in-memory buffer, recordMessage dropped the
+  // message, nothing was persisted — and the orchestrator was still told
+  // {success: true} with a messageId for a message that existed nowhere.
+  getRoom(roomName);
+
   const message = {
     id: uuidv4(),
     type: "broadcast",
+    agentId: null,
+    agentName: from,
     content: `[${from}] ${content}`,
+    mentions: [],
+    metadata: { from },
     timestamp: nextTimestamp(roomName),
     room: roomName,
     from,
   };
 
-  recordMessage(roomName, message);
-  io.to(roomName).emit("message", message);
+  // Broadcasts were never written to the messages table, so they survived only
+  // in the in-memory buffer: gone on restart, and absent from the DB-fallback
+  // read path used when a `since` reaches past the in-memory horizon. An agent
+  // paging through backlog silently never saw them. Gate the 200 on the write.
+  persistMessage(message, function (err) {
+    if (err) {
+      logger.error(
+        `Failed to persist broadcast to ${roomName}: ${err.message}`
+      );
+      return res.status(500).json({
+        success: false,
+        error: "Failed to persist broadcast — not delivered",
+      });
+    }
 
-  res.json({ success: true, messageId: message.id });
+    recordMessage(roomName, message);
+    io.to(roomName).emit("message", message);
+
+    res.json({ success: true, messageId: message.id });
+  });
 });
 
 app.post("/api/tasks/:taskId/update", (req, res) => {
