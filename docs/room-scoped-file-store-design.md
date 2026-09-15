@@ -39,11 +39,13 @@ The authoritative content layout is private implementation detail:
 
 ```text
 FILE_STORE_DIR/
-  rooms/<room-id>/<opaque-file-id>/content
+  objects/<opaque-file-id>/v<version>
 ```
 
-SQLite stores the logical room path and metadata. Do not derive a host path from
-a client-supplied filename. Logical paths are normalized POSIX relative paths:
+SQLite stores the logical room path, current version, and metadata. Each file
+version is immutable, so a failed metadata transaction can leave only an
+unreferenced object; it cannot replace bytes served by the prior version. Do
+not derive a host path from a client-supplied filename. Logical paths are normalized POSIX relative paths:
 no absolute paths, `..`, empty components, NULs, or backslashes. The canonical
 identity is `(room_id, logical_path)`.
 

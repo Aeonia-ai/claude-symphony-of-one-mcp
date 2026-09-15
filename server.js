@@ -35,7 +35,13 @@ io.use((socket, next) => {
 });
 
 app.use(cors());
-app.use(express.json());
+// File PUTs need their original bytes, including valid JSON documents. Let the
+// route-local raw parser own those bodies; JSON remains the default elsewhere.
+app.use(express.json({
+  type: (req) => !(
+    req.method === "PUT" && /^\/api\/rooms\/[^/]+\/files\//.test(req.originalUrl || req.url)
+  ) && Boolean(req.is("application/json")),
+}));
 
 // Shared-token auth (gracefully disabled when AUTH_TOKEN is unset)
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
@@ -788,9 +794,11 @@ function actorForFileRequest(req) {
   return String(req.headers["x-symphony-actor"] || req.headers["x-agent-name"] || "trusted-team").slice(0, 200);
 }
 
-function fileContentPath(fileId) {
-  // UUIDs are server-generated; no request-derived segment reaches the path.
-  return path.join(FILE_STORE_DIR, "objects", fileId, "content");
+function fileContentPath(fileId, version) {
+  // Both values are server-generated. Each version is immutable, so an
+  // unsuccessful metadata transaction can leave at most an unreferenced file,
+  // never replace the bytes referenced by the previous version.
+  return path.join(FILE_STORE_DIR, "objects", fileId, `v${version}`);
 }
 
 function dbGet(sql, params) {
@@ -873,7 +881,7 @@ app.get("/api/rooms/:room/files/*", async (req, res) => {
   try {
     const file = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ? AND deleted_at IS NULL", [req.params.room, logicalPath]);
     if (!file) return fileError(res, 404, "NOT_FOUND", "File not found");
-    const content = await fs.readFile(fileContentPath(file.id));
+    const content = await fs.readFile(fileContentPath(file.id, file.version));
     const metadata = publicFile(file);
     // JSON is opt-in. A normal/no Accept header should stream bytes, not make
     // a binary download unexpectedly negotiate to JSON through `*/*`.
@@ -908,14 +916,21 @@ app.put("/api/rooms/:room/files/*", express.raw({ type: "*/*", limit: MAX_BINARY
     const version = (existing?.version || 0) + 1;
     const now = new Date().toISOString();
     const sha256 = crypto.createHash("sha256").update(body).digest("hex");
-    const target = fileContentPath(id);
+    const target = fileContentPath(id, version);
     await fs.mkdir(path.dirname(target), { recursive: true });
     const temp = `${target}.${uuidv4()}.tmp`;
     await fs.writeFile(temp, body, { flag: "wx" });
     await fs.rename(temp, target);
-    if (existing) await dbRunAsync("UPDATE files SET content_type=?, byte_size=?, sha256=?, version=?, updated_at=?, updated_by=?, deleted_at=NULL WHERE id=?", [contentType, body.length, sha256, version, now, actor, id]);
-    else await dbRunAsync("INSERT INTO files (id,room,logical_path,content_type,byte_size,sha256,version,created_at,created_by,updated_at,updated_by,deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)", [id, req.params.room, logicalPath, contentType, body.length, sha256, version, now, actor, now, actor]);
-    await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), id, version, sha256, body.length, actor, now, existing ? "write" : "create"]);
+    await dbRunAsync("BEGIN IMMEDIATE", []);
+    try {
+      if (existing) await dbRunAsync("UPDATE files SET content_type=?, byte_size=?, sha256=?, version=?, updated_at=?, updated_by=?, deleted_at=NULL WHERE id=?", [contentType, body.length, sha256, version, now, actor, id]);
+      else await dbRunAsync("INSERT INTO files (id,room,logical_path,content_type,byte_size,sha256,version,created_at,created_by,updated_at,updated_by,deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)", [id, req.params.room, logicalPath, contentType, body.length, sha256, version, now, actor, now, actor]);
+      await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), id, version, sha256, body.length, actor, now, existing ? "write" : "create"]);
+      await dbRunAsync("COMMIT", []);
+    } catch (error) {
+      try { await dbRunAsync("ROLLBACK", []); } catch {}
+      throw error;
+    }
     const row = await dbGet("SELECT * FROM files WHERE id=?", [id]);
     await auditFile(actor, req.params.room, existing ? "write" : "create", logicalPath, "success", req, { version, byteSize: body.length, sha256 });
     emitFileChange(req.params.room, existing ? "write" : "create", row, actor);
@@ -1761,6 +1776,16 @@ app.post("/api/notifications/:notificationId/read", (req, res) => {
       res.json({ success: true, updated: this.changes > 0 });
     }
   );
+});
+
+// body-parser normally renders an HTML 413. Keep the file API's documented
+// JSON error contract even when the raw parser rejects a body before its route
+// handler is entered.
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large" && /^\/api\/rooms\/[^/]+\/files\//.test(req.originalUrl || req.url)) {
+    return fileError(res, 413, "PAYLOAD_TOO_LARGE", "File exceeds the allowed size");
+  }
+  return next(err);
 });
 
 // WebSocket handling
