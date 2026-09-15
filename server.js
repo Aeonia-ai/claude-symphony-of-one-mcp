@@ -6,6 +6,7 @@ import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 import chokidar from "chokidar";
 import sqlite3 from "sqlite3";
 import winston from "winston";
@@ -55,6 +56,12 @@ app.use('/api', (req, res, next) => {
 // Configuration
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
+// This is deliberately separate from SHARED_DIR. SHARED_DIR is the legacy
+// local-watcher directory; FILE_STORE_DIR is private hub-managed storage.
+const FILE_STORE_DIR = process.env.FILE_STORE_DIR || path.join(DATA_DIR, "files");
+const FILES_AUTHZ_MODE = process.env.FILES_AUTHZ_MODE || "trusted-team";
+const MAX_TEXT_FILE_BYTES = 1024 * 1024;
+const MAX_BINARY_FILE_BYTES = 10 * 1024 * 1024;
 
 // Logging setup
 const logger = winston.createLogger({
@@ -107,6 +114,8 @@ async function initializeSystem() {
     await fs.mkdir(SHARED_DIR, { recursive: true });
     logger.info(`Created shared directory: ${SHARED_DIR}`);
   }
+
+  await fs.mkdir(FILE_STORE_DIR, { recursive: true });
 
   try {
     await fs.access(DATA_DIR);
@@ -192,6 +201,45 @@ async function initializeSystem() {
         type TEXT DEFAULT 'mention',
         is_read BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`);
+
+      // The logical path is metadata only. Content is kept under an opaque id,
+      // so no request path is ever used as a host filesystem path.
+      db.run(`CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        room TEXT NOT NULL,
+        logical_path TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        deleted_at TEXT,
+        UNIQUE(room, logical_path)
+      )`);
+      db.run(`CREATE TABLE IF NOT EXISTS file_revisions (
+        id TEXT PRIMARY KEY,
+        file_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        sha256 TEXT,
+        byte_size INTEGER,
+        actor_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        operation TEXT NOT NULL
+      )`);
+      db.run(`CREATE TABLE IF NOT EXISTS file_audit (
+        id TEXT PRIMARY KEY,
+        actor_id TEXT NOT NULL,
+        room TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        logical_path TEXT,
+        result TEXT NOT NULL,
+        request_id TEXT,
+        timestamp TEXT NOT NULL,
+        metadata TEXT
       )`, (err) => {
         if (err) reject(err); else resolve();
       });
@@ -719,6 +767,181 @@ function getRoom(roomName) {
   }
   return rooms.get(roomName);
 }
+
+// ---- Hub-managed, room-scoped file store ---------------------------------
+// Kept here rather than in the legacy chokidar watcher: these files are shared
+// through the hub API and must never become arbitrary host filesystem access.
+function fileError(res, status, code, error) {
+  return res.status(status).json({ success: false, code, error });
+}
+
+function normalizeLogicalPath(value) {
+  if (typeof value !== "string" || !value || value.includes("\0") || value.includes("\\")) return null;
+  const parts = value.split("/");
+  if (!parts.length || parts.some((p) => !p || p === "." || p === "..")) return null;
+  return parts.join("/");
+}
+
+function actorForFileRequest(req) {
+  // The shared token can identify only the trusted team. An agent name may be
+  // recorded for audit visibility, but is not an authorization claim.
+  return String(req.headers["x-symphony-actor"] || req.headers["x-agent-name"] || "trusted-team").slice(0, 200);
+}
+
+function fileContentPath(fileId) {
+  // UUIDs are server-generated; no request-derived segment reaches the path.
+  return path.join(FILE_STORE_DIR, "objects", fileId, "content");
+}
+
+function dbGet(sql, params) {
+  return new Promise((resolve, reject) => db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)));
+}
+function dbAll(sql, params) {
+  return new Promise((resolve, reject) => db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows)));
+}
+function dbRunAsync(sql, params) {
+  return new Promise((resolve, reject) => db.run(sql, params, function (err) { err ? reject(err) : resolve(this); }));
+}
+function publicFile(row) {
+  return {
+    path: row.logical_path, contentType: row.content_type, byteSize: row.byte_size,
+    sha256: row.sha256, version: row.version, createdAt: row.created_at,
+    createdBy: row.created_by, updatedAt: row.updated_at, updatedBy: row.updated_by,
+  };
+}
+async function auditFile(actor, room, operation, logicalPath, result, req, metadata = {}) {
+  try {
+    await dbRunAsync(
+      "INSERT INTO file_audit (id, actor_id, room, operation, logical_path, result, request_id, timestamp, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [uuidv4(), actor, room, operation, logicalPath, result, String(req.headers["x-request-id"] || "").slice(0, 200), new Date().toISOString(), JSON.stringify(metadata)]
+    );
+  } catch (err) { logger.error(`Failed to audit file operation: ${err.message}`); }
+}
+function requireFileRoom(req, res) {
+  if (FILES_AUTHZ_MODE !== "trusted-team") {
+    fileError(res, 403, "FORBIDDEN", "File authorization mode is not configured");
+    return null;
+  }
+  const room = rooms.get(req.params.room);
+  if (!room) {
+    fileError(res, 404, "ROOM_NOT_FOUND", "Room not found");
+    return null;
+  }
+  return room;
+}
+function emitFileChange(room, operation, row, actor) {
+  io.to(room).emit("file_changed", {
+    operation, path: row.logical_path, version: row.version, sha256: row.sha256,
+    byteSize: row.byte_size, actor, timestamp: new Date().toISOString(),
+  });
+}
+
+app.get("/api/rooms/:room/files", async (req, res) => {
+  if (!requireFileRoom(req, res)) return;
+  const prefix = req.query.prefix === undefined ? "" : normalizeLogicalPath(String(req.query.prefix).replace(/\/$/, ""));
+  if (prefix === null) return fileError(res, 400, "INVALID_PATH", "Invalid file path prefix");
+  const requested = Number.parseInt(req.query.limit || "100", 10);
+  const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : 100, 1), 500);
+  const cursor = String(req.query.cursor || "");
+  try {
+    const rows = await dbAll(
+      "SELECT * FROM files WHERE room = ? AND deleted_at IS NULL AND logical_path LIKE ? AND logical_path > ? ORDER BY logical_path LIMIT ?",
+      [req.params.room, `${prefix}${prefix ? "/" : ""}%`, cursor, limit + 1]
+    );
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit).map(publicFile);
+    res.json({ files: page, returned: page.length, hasMore, ...(hasMore ? { nextCursor: page.at(-1).path } : {}) });
+  } catch (err) { logger.error(`File list failed: ${err.message}`); fileError(res, 500, "INTERNAL_ERROR", "File list failed"); }
+});
+
+app.get("/api/rooms/:room/files/*/revisions", async (req, res) => {
+  if (!requireFileRoom(req, res)) return;
+  const logicalPath = normalizeLogicalPath(req.params[0]);
+  if (!logicalPath) return fileError(res, 400, "INVALID_PATH", "Invalid file path");
+  try {
+    const file = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ?", [req.params.room, logicalPath]);
+    if (!file) return fileError(res, 404, "NOT_FOUND", "File not found");
+    const revisions = await dbAll("SELECT version, sha256, byte_size AS byteSize, actor_id AS actorId, timestamp, operation FROM file_revisions WHERE file_id = ? ORDER BY version DESC", [file.id]);
+    res.json({ path: logicalPath, revisions });
+  } catch (err) { logger.error(`File revisions failed: ${err.message}`); fileError(res, 500, "INTERNAL_ERROR", "File revisions failed"); }
+});
+
+app.get("/api/rooms/:room/files/*", async (req, res) => {
+  if (!requireFileRoom(req, res)) return;
+  const logicalPath = normalizeLogicalPath(req.params[0]);
+  if (!logicalPath) return fileError(res, 400, "INVALID_PATH", "Invalid file path");
+  try {
+    const file = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ? AND deleted_at IS NULL", [req.params.room, logicalPath]);
+    if (!file) return fileError(res, 404, "NOT_FOUND", "File not found");
+    const content = await fs.readFile(fileContentPath(file.id));
+    const metadata = publicFile(file);
+    // JSON is opt-in. A normal/no Accept header should stream bytes, not make
+    // a binary download unexpectedly negotiate to JSON through `*/*`.
+    if (String(req.headers.accept || "").split(",").some((value) => value.trim().startsWith("application/json"))) {
+      if (!file.content_type.startsWith("text/") && file.content_type !== "application/json") return fileError(res, 406, "NOT_ACCEPTABLE", "JSON reads are available for text files only");
+      return res.json({ ...metadata, content: content.toString("utf8") });
+    }
+    res.set({ "Content-Type": file.content_type, "Content-Length": String(content.length), "ETag": `\"${file.version}\"`, "X-Symphony-Version": String(file.version), "X-Symphony-SHA256": file.sha256 });
+    res.send(content);
+  } catch (err) { logger.error(`File read failed: ${err.message}`); fileError(res, 500, "INTERNAL_ERROR", "File read failed"); }
+});
+
+app.put("/api/rooms/:room/files/*", express.raw({ type: "*/*", limit: MAX_BINARY_FILE_BYTES }), async (req, res) => {
+  if (!requireFileRoom(req, res)) return;
+  const logicalPath = normalizeLogicalPath(req.params[0]);
+  if (!logicalPath) return fileError(res, 400, "INVALID_PATH", "Invalid file path");
+  const contentType = String(req.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+  if (!contentType) return fileError(res, 400, "INVALID_ARGUMENT", "Content-Type is required");
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from("");
+  const maxBytes = contentType.startsWith("text/") || contentType === "application/json" ? MAX_TEXT_FILE_BYTES : MAX_BINARY_FILE_BYTES;
+  if (body.length > maxBytes) return fileError(res, 413, "PAYLOAD_TOO_LARGE", "File exceeds the allowed size");
+  const actor = actorForFileRequest(req);
+  try {
+    const existing = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ?", [req.params.room, logicalPath]);
+    const ifMatch = req.headers["if-match"];
+    if (existing && existing.deleted_at === null && String(ifMatch || "").replaceAll('"', "") !== String(existing.version)) {
+      await auditFile(actor, req.params.room, "write", logicalPath, "conflict", req, { expectedVersion: existing.version });
+      return fileError(res, 409, "CONFLICT", "File has changed; fetch its current version before replacing it");
+    }
+    if (!existing && req.headers["if-none-match"] !== "*") return fileError(res, 409, "CONFLICT", "New files require If-None-Match: *");
+    const id = existing?.id || uuidv4();
+    const version = (existing?.version || 0) + 1;
+    const now = new Date().toISOString();
+    const sha256 = crypto.createHash("sha256").update(body).digest("hex");
+    const target = fileContentPath(id);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const temp = `${target}.${uuidv4()}.tmp`;
+    await fs.writeFile(temp, body, { flag: "wx" });
+    await fs.rename(temp, target);
+    if (existing) await dbRunAsync("UPDATE files SET content_type=?, byte_size=?, sha256=?, version=?, updated_at=?, updated_by=?, deleted_at=NULL WHERE id=?", [contentType, body.length, sha256, version, now, actor, id]);
+    else await dbRunAsync("INSERT INTO files (id,room,logical_path,content_type,byte_size,sha256,version,created_at,created_by,updated_at,updated_by,deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)", [id, req.params.room, logicalPath, contentType, body.length, sha256, version, now, actor, now, actor]);
+    await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), id, version, sha256, body.length, actor, now, existing ? "write" : "create"]);
+    const row = await dbGet("SELECT * FROM files WHERE id=?", [id]);
+    await auditFile(actor, req.params.room, existing ? "write" : "create", logicalPath, "success", req, { version, byteSize: body.length, sha256 });
+    emitFileChange(req.params.room, existing ? "write" : "create", row, actor);
+    res.status(existing ? 200 : 201).set("ETag", `\"${version}\"`).json({ success: true, file: publicFile(row) });
+  } catch (err) { logger.error(`File write failed: ${err.message}`); await auditFile(actor, req.params.room, "write", logicalPath, "error", req); fileError(res, 500, "INTERNAL_ERROR", "File write failed"); }
+});
+
+app.delete("/api/rooms/:room/files/*", async (req, res) => {
+  if (!requireFileRoom(req, res)) return;
+  const logicalPath = normalizeLogicalPath(req.params[0]);
+  if (!logicalPath) return fileError(res, 400, "INVALID_PATH", "Invalid file path");
+  if (req.headers["x-confirm-delete"] !== "true") return fileError(res, 400, "INVALID_ARGUMENT", "Deletion requires X-Confirm-Delete: true");
+  const actor = actorForFileRequest(req);
+  try {
+    const file = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ? AND deleted_at IS NULL", [req.params.room, logicalPath]);
+    if (!file) return fileError(res, 404, "NOT_FOUND", "File not found");
+    if (String(req.headers["if-match"] || "").replaceAll('"', "") !== String(file.version)) return fileError(res, 409, "CONFLICT", "File has changed; fetch its current version before deleting it");
+    const now = new Date().toISOString(), version = file.version + 1;
+    await dbRunAsync("UPDATE files SET version=?, updated_at=?, updated_by=?, deleted_at=? WHERE id=?", [version, now, actor, now, file.id]);
+    await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), file.id, version, file.sha256, file.byte_size, actor, now, "delete"]);
+    const row = { ...file, version, updated_at: now, updated_by: actor };
+    await auditFile(actor, req.params.room, "delete", logicalPath, "success", req, { version });
+    emitFileChange(req.params.room, "delete", row, actor);
+    res.json({ success: true, file: publicFile(row) });
+  } catch (err) { logger.error(`File delete failed: ${err.message}`); fileError(res, 500, "INTERNAL_ERROR", "File delete failed"); }
+});
 
 // HTTP API Endpoints
 app.post("/api/join/:room", (req, res) => {

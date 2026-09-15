@@ -61,10 +61,10 @@ describe("MCP end-to-end", () => {
     await srv.stop();
   });
 
-  it("handshakes and lists all 17 tools", async () => {
+  it("handshakes and lists all 18 tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    assert.equal(tools.length, 17, `expected 17 tools, got ${tools.length}`);
+    assert.equal(tools.length, 18, `expected 18 tools, got ${tools.length}`);
     for (const expected of [
       "room_join",
       "send_message",
