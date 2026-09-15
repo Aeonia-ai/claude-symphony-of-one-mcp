@@ -12,6 +12,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.CHAT_SERVER_URL || "http://localhost:3000";
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");
 const HUB_AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+// `local` remains the compatibility default. `remote` is the explicit opt-in
+// for room-scoped hub storage; it never reads or writes the client's disk.
+const FILE_BACKEND = process.env.SYMPHONY_FILE_BACKEND || "local";
 // Set SYMPHONY_USE_MESSAGE_CACHE=true to use the local Socket.IO buffer for
 // get_messages instead of always fetching from the server. Faster for
 // single-agent local use; incorrect for multi-agent cross-machine coordination.
@@ -67,6 +70,27 @@ async function ensureSharedDir() {
     await fs.mkdir(SHARED_DIR, { recursive: true });
     console.error(`Created shared directory: ${SHARED_DIR}`);
   }
+}
+
+function remoteFileUrl(filename = "") {
+  if (!currentRoom) throw new Error("Not in a room. Use room_join first.");
+  const room = encodeURIComponent(currentRoom);
+  const suffix = filename
+    ? `/${filename.split("/").map(encodeURIComponent).join("/")}`
+    : "";
+  return `${SERVER_URL.replace(/\/$/, "")}/api/rooms/${room}/files${suffix}`;
+}
+
+async function remoteFileRequest(filename, options = {}) {
+  const headers = { "X-Agent-Name": agentName, ...(options.headers || {}) };
+  if (HUB_AUTH_TOKEN) headers["X-Auth-Token"] = HUB_AUTH_TOKEN;
+  const response = await fetch(remoteFileUrl(filename), { ...options, headers });
+  if (!response.ok) {
+    let detail = "";
+    try { const body = await response.json(); detail = body.error || body.code || ""; } catch { detail = await response.text(); }
+    throw new Error(`${response.status}${detail ? ` ${detail}` : ""}`);
+  }
+  return response;
 }
 
 // Create MCP server instance
@@ -1050,6 +1074,11 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if (FILE_BACKEND === "remote") {
+        const response = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+        const file = await response.json();
+        return { content: [{ type: "text", text: `Content of ${file.path} (v${file.version}, ${file.byteSize} bytes, sha256 ${file.sha256}):\n\n${file.content}` }] };
+      }
       const filePath = path.join(SHARED_DIR, params.filename);
 
       // Security check - ensure file is within shared directory
@@ -1102,6 +1131,27 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if (FILE_BACKEND === "remote") {
+        // Read first to obtain the version. A concurrent writer results in a
+        // clear conflict instead of a silent last-write-wins overwrite.
+        let version = null;
+        try {
+          const current = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+          version = (await current.json()).version;
+        } catch (error) {
+          if (!String(error.message).startsWith("404")) throw error;
+        }
+        const response = await remoteFileRequest(params.filename, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            ...(version === null ? { "If-None-Match": "*" } : { "If-Match": String(version) }),
+          },
+          body: params.content,
+        });
+        const { file } = await response.json();
+        return { content: [{ type: "text", text: `Shared file written: ${file.path} (v${file.version}, ${file.byteSize} bytes, sha256 ${file.sha256})` }] };
+      }
       const filePath = path.join(SHARED_DIR, params.filename);
 
       // Security check - ensure file is within shared directory
@@ -1153,6 +1203,18 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if (FILE_BACKEND === "remote") {
+        const query = params.subdirectory ? `?prefix=${encodeURIComponent(params.subdirectory)}` : "";
+        // remoteFileUrl() deliberately treats a filename as a path. Add the
+        // list query after construction so an optional prefix stays metadata.
+        const url = `${remoteFileUrl()}${query}`;
+        const headers = { Accept: "application/json", "X-Agent-Name": agentName, ...(HUB_AUTH_TOKEN ? { "X-Auth-Token": HUB_AUTH_TOKEN } : {}) };
+        const listed = await fetch(url, { headers });
+        if (!listed.ok) throw new Error(`${listed.status} ${(await listed.json().catch(() => ({}))).error || ""}`);
+        const { files } = await listed.json();
+        const lines = files.map((f) => `[FILE] ${f.path}  v${f.version}  ${f.byteSize} bytes  ${f.sha256}`).join("\n");
+        return { content: [{ type: "text", text: `Shared files in room "${currentRoom}":\n\n${lines || "No files found"}` }] };
+      }
       const targetDir = params.subdirectory
         ? path.join(SHARED_DIR, params.subdirectory)
         : SHARED_DIR;
@@ -1200,6 +1262,29 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "file_delete",
+  {
+    title: "Delete File",
+    description: "Delete a file from the shared workspace. In remote mode this deletes the room-scoped shared file.",
+    inputSchema: { filename: z.string().describe("Name of the file to delete"), confirm: z.literal(true).describe("Explicit confirmation required") },
+  },
+  async (params) => {
+    if (FILE_BACKEND !== "remote") {
+      return { content: [{ type: "text", text: "file_delete is available only with SYMPHONY_FILE_BACKEND=remote; local mode intentionally preserves the existing tool set." }], isError: true };
+    }
+    try {
+      const current = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+      const file = await current.json();
+      const response = await remoteFileRequest(params.filename, { method: "DELETE", headers: { "If-Match": String(file.version), "X-Confirm-Delete": "true" } });
+      const result = await response.json();
+      return { content: [{ type: "text", text: `Shared file deleted: ${result.file.path} (v${result.file.version})` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Failed to delete shared file: ${error.message}` }], isError: true };
+    }
+  }
+);
+
 // Exported helpers for testing (and for clearRoomCache used in room_join)
 export function clearRoomCache() {
   messageHistory = [];
@@ -1220,8 +1305,9 @@ async function main() {
   console.error(`Hub Server: ${SERVER_URL}`);
   console.error(`Agent Name: ${agentName}`);
   console.error(`Shared Directory: ${SHARED_DIR}`);
+  console.error(`File Backend: ${FILE_BACKEND}`);
 
-  await ensureSharedDir();
+  if (FILE_BACKEND === "local") await ensureSharedDir();
 
   const stdioTransport = new StdioServerTransport();
   await server.connect(stdioTransport);
