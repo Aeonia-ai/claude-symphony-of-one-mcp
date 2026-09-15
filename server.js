@@ -111,6 +111,10 @@ const messages = new Map();
 const tasks = new Map();
 const fileWatcher = new Map();
 const agentMemory = new Map(); // Persistent agent memories
+// SQLite uses one connection for this hub. Queue mutations per logical file so
+// an optimistic version check and its transaction cannot interleave with a
+// second writer for that same file.
+const fileMutationTails = new Map();
 
 // Initialize directories and database
 async function initializeSystem() {
@@ -801,6 +805,21 @@ function fileContentPath(fileId, version) {
   return path.join(FILE_STORE_DIR, "objects", fileId, `v${version}`);
 }
 
+async function withFileMutation(room, logicalPath, operation) {
+  const key = JSON.stringify([room, logicalPath]);
+  const previous = fileMutationTails.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => gate);
+  fileMutationTails.set(key, tail);
+  await previous.catch(() => {});
+  try { return await operation(); }
+  finally {
+    release();
+    if (fileMutationTails.get(key) === tail) fileMutationTails.delete(key);
+  }
+}
+
 function dbGet(sql, params) {
   return new Promise((resolve, reject) => db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)));
 }
@@ -904,14 +923,26 @@ app.put("/api/rooms/:room/files/*", express.raw({ type: "*/*", limit: MAX_BINARY
   const maxBytes = contentType.startsWith("text/") || contentType === "application/json" ? MAX_TEXT_FILE_BYTES : MAX_BINARY_FILE_BYTES;
   if (body.length > maxBytes) return fileError(res, 413, "PAYLOAD_TOO_LARGE", "File exceeds the allowed size");
   const actor = actorForFileRequest(req);
-  try {
+  return withFileMutation(req.params.room, logicalPath, async () => {
+    let transactionOpen = false;
+    try {
+    // Acquire the write lock before looking up the version. Two simultaneous
+    // writers therefore cannot both decide that version N is current.
+    await dbRunAsync("BEGIN IMMEDIATE", []);
+    transactionOpen = true;
     const existing = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ?", [req.params.room, logicalPath]);
     const ifMatch = req.headers["if-match"];
     if (existing && existing.deleted_at === null && String(ifMatch || "").replaceAll('"', "") !== String(existing.version)) {
+      await dbRunAsync("ROLLBACK", []);
+      transactionOpen = false;
       await auditFile(actor, req.params.room, "write", logicalPath, "conflict", req, { expectedVersion: existing.version });
       return fileError(res, 409, "CONFLICT", "File has changed; fetch its current version before replacing it");
     }
-    if (!existing && req.headers["if-none-match"] !== "*") return fileError(res, 409, "CONFLICT", "New files require If-None-Match: *");
+    if (!existing && req.headers["if-none-match"] !== "*") {
+      await dbRunAsync("ROLLBACK", []);
+      transactionOpen = false;
+      return fileError(res, 409, "CONFLICT", "New files require If-None-Match: *");
+    }
     const id = existing?.id || uuidv4();
     const version = (existing?.version || 0) + 1;
     const now = new Date().toISOString();
@@ -921,21 +952,26 @@ app.put("/api/rooms/:room/files/*", express.raw({ type: "*/*", limit: MAX_BINARY
     const temp = `${target}.${uuidv4()}.tmp`;
     await fs.writeFile(temp, body, { flag: "wx" });
     await fs.rename(temp, target);
-    await dbRunAsync("BEGIN IMMEDIATE", []);
     try {
       if (existing) await dbRunAsync("UPDATE files SET content_type=?, byte_size=?, sha256=?, version=?, updated_at=?, updated_by=?, deleted_at=NULL WHERE id=?", [contentType, body.length, sha256, version, now, actor, id]);
       else await dbRunAsync("INSERT INTO files (id,room,logical_path,content_type,byte_size,sha256,version,created_at,created_by,updated_at,updated_by,deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)", [id, req.params.room, logicalPath, contentType, body.length, sha256, version, now, actor, now, actor]);
       await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), id, version, sha256, body.length, actor, now, existing ? "write" : "create"]);
       await dbRunAsync("COMMIT", []);
+      transactionOpen = false;
     } catch (error) {
       try { await dbRunAsync("ROLLBACK", []); } catch {}
+      transactionOpen = false;
       throw error;
     }
     const row = await dbGet("SELECT * FROM files WHERE id=?", [id]);
     await auditFile(actor, req.params.room, existing ? "write" : "create", logicalPath, "success", req, { version, byteSize: body.length, sha256 });
     emitFileChange(req.params.room, existing ? "write" : "create", row, actor);
     res.status(existing ? 200 : 201).set("ETag", `\"${version}\"`).json({ success: true, file: publicFile(row) });
-  } catch (err) { logger.error(`File write failed: ${err.message}`); await auditFile(actor, req.params.room, "write", logicalPath, "error", req); fileError(res, 500, "INTERNAL_ERROR", "File write failed"); }
+    } catch (err) {
+      if (transactionOpen) { try { await dbRunAsync("ROLLBACK", []); } catch {} }
+      logger.error(`File write failed: ${err.message}`); await auditFile(actor, req.params.room, "write", logicalPath, "error", req); return fileError(res, 500, "INTERNAL_ERROR", "File write failed");
+    }
+  });
 });
 
 app.delete("/api/rooms/:room/files/*", async (req, res) => {
@@ -944,18 +980,36 @@ app.delete("/api/rooms/:room/files/*", async (req, res) => {
   if (!logicalPath) return fileError(res, 400, "INVALID_PATH", "Invalid file path");
   if (req.headers["x-confirm-delete"] !== "true") return fileError(res, 400, "INVALID_ARGUMENT", "Deletion requires X-Confirm-Delete: true");
   const actor = actorForFileRequest(req);
-  try {
+  return withFileMutation(req.params.room, logicalPath, async () => {
+    let transactionOpen = false;
+    try {
+    await dbRunAsync("BEGIN IMMEDIATE", []);
+    transactionOpen = true;
     const file = await dbGet("SELECT * FROM files WHERE room = ? AND logical_path = ? AND deleted_at IS NULL", [req.params.room, logicalPath]);
-    if (!file) return fileError(res, 404, "NOT_FOUND", "File not found");
-    if (String(req.headers["if-match"] || "").replaceAll('"', "") !== String(file.version)) return fileError(res, 409, "CONFLICT", "File has changed; fetch its current version before deleting it");
+    if (!file) {
+      await dbRunAsync("ROLLBACK", []);
+      transactionOpen = false;
+      return fileError(res, 404, "NOT_FOUND", "File not found");
+    }
+    if (String(req.headers["if-match"] || "").replaceAll('"', "") !== String(file.version)) {
+      await dbRunAsync("ROLLBACK", []);
+      transactionOpen = false;
+      return fileError(res, 409, "CONFLICT", "File has changed; fetch its current version before deleting it");
+    }
     const now = new Date().toISOString(), version = file.version + 1;
     await dbRunAsync("UPDATE files SET version=?, updated_at=?, updated_by=?, deleted_at=? WHERE id=?", [version, now, actor, now, file.id]);
     await dbRunAsync("INSERT INTO file_revisions (id,file_id,version,sha256,byte_size,actor_id,timestamp,operation) VALUES (?,?,?,?,?,?,?,?)", [uuidv4(), file.id, version, file.sha256, file.byte_size, actor, now, "delete"]);
+    await dbRunAsync("COMMIT", []);
+    transactionOpen = false;
     const row = { ...file, version, updated_at: now, updated_by: actor };
     await auditFile(actor, req.params.room, "delete", logicalPath, "success", req, { version });
     emitFileChange(req.params.room, "delete", row, actor);
     res.json({ success: true, file: publicFile(row) });
-  } catch (err) { logger.error(`File delete failed: ${err.message}`); fileError(res, 500, "INTERNAL_ERROR", "File delete failed"); }
+    } catch (err) {
+      if (transactionOpen) { try { await dbRunAsync("ROLLBACK", []); } catch {} }
+      logger.error(`File delete failed: ${err.message}`); return fileError(res, 500, "INTERNAL_ERROR", "File delete failed");
+    }
+  });
 });
 
 // HTTP API Endpoints

@@ -106,5 +106,31 @@ describe("room-scoped hub file store", () => {
     const read = await (await fetch(`${base}/api/rooms/${room}/files/${name}`, { headers: { ...auth, Accept: "application/json" } })).json();
     assert.equal(read.version, 1);
     assert.equal(read.content, "stable");
+    await dbRun("DROP TRIGGER reject_file_revision");
+  });
+
+  it("turns a simultaneous stale writer into a conflict rather than a 500", async () => {
+    const name = "race.md";
+    assert.equal((await put(name, "v1", { "If-None-Match": "*" })).status, 201);
+    const results = await Promise.all([
+      put(name, "writer-a", { "If-Match": "1" }),
+      put(name, "writer-b", { "If-Match": "1" }),
+    ]);
+    assert.deepEqual(results.map((response) => response.status).sort(), [200, 409]);
+  });
+
+  it("does not soft-delete a file when its delete revision cannot be recorded", async () => {
+    const name = "delete-atomic.md";
+    assert.equal((await put(name, "keep me", { "If-None-Match": "*" })).status, 201);
+    const dbRun = (sql) => new Promise((resolve, reject) => {
+      const db = new sqlite3.Database(srv.dbPath);
+      db.run(sql, (error) => db.close(() => error ? reject(error) : resolve()));
+    });
+    await dbRun("CREATE TRIGGER reject_delete_revision BEFORE INSERT ON file_revisions WHEN NEW.operation = 'delete' BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END");
+    const deleted = await fetch(`${base}/api/rooms/${room}/files/${name}`, { method: "DELETE", headers: { ...auth, "If-Match": "1", "X-Confirm-Delete": "true" } });
+    assert.equal(deleted.status, 500);
+    const read = await (await fetch(`${base}/api/rooms/${room}/files/${name}`, { headers: { ...auth, Accept: "application/json" } })).json();
+    assert.equal(read.content, "keep me");
+    assert.equal(read.version, 1);
   });
 });
