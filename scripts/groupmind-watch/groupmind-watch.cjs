@@ -62,14 +62,22 @@ const url = args.url || process.env.CHAT_SERVER_URL || cfgEnv.CHAT_SERVER_URL;
 const token = process.env.AUTH_TOKEN || cfgEnv.AUTH_TOKEN || "";
 const me = args.me || process.env.AGENT_NAME || cfgEnv.AGENT_NAME || "";
 const room = args.room || process.env.SYMPHONY_ROOM || "groupmind";
-const baseIntervalMs = Number(args.interval || 60) * 1000;
+// A bad --interval must not become a tight loop or a negative cadence. Zero,
+// negative and non-numeric values all fall back to the default rather than being
+// trusted: this script's whole purpose is to poll gently.
+function seconds(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const baseIntervalMs = seconds(args.interval, 60) * 1000;
 // Idle backoff, off unless asked for. When --max-interval is set above
 // --interval, an idle room doubles the wait between polls up to that ceiling,
 // and ANY traffic drops it straight back to the base interval. The trade is
 // explicit: a quiet room costs fewer requests, and the first message after a
 // long silence waits up to --max-interval to be seen. Leave it unset and the
 // cadence is exactly as before.
-const maxIntervalMs = Number(args["max-interval"] || 0) * 1000;
+const maxIntervalMs = seconds(args["max-interval"], 0) * 1000;
 const backoffEnabled = maxIntervalMs > baseIntervalMs;
 let intervalMs = baseIntervalMs;
 const mentionsOnly = Boolean(args["mentions-only"]);
@@ -185,7 +193,9 @@ async function poll() {
     // Transient DNS/network blips are common; stay silent and retry next tick.
     failed = true;
   }
-  return failed ? null : seen;
+  // A failure after traffic is still traffic: report what was seen so the cadence
+  // resets. Only a poll that failed having seen nothing is genuinely unknown.
+  return failed && seen === 0 ? null : seen;
 }
 
 // Any traffic at all resets the cadence, including messages that were filtered
