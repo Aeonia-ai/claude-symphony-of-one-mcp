@@ -80,6 +80,10 @@ if (debug) {
 }
 
 let since = args.since || new Date().toISOString();
+// Only consecutive identical errors are suppressed: two alternating failures
+// (a flapping DNS error and an HTTP 502, say) will report on every tick. Left as
+// is deliberately — these go to stderr, so the cost is log noise, and a
+// genuinely flapping hub is worth seeing.
 let lastErrorMsg = "";
 
 const PAGE = 50;
@@ -97,9 +101,16 @@ async function fetchPage() {
   });
 
   if (res.status === 401 || res.status === 403) {
+    // Deliberately stdout, unlike every other diagnostic here. Under a
+    // supervising monitor only stdout becomes a notification; stderr lands in a
+    // file nobody opens unless they already suspect a problem. A rejected token
+    // is permanent, silent, and needs a human — routing it to stderr makes a bad
+    // token indistinguishable from a quiet room, which is the one failure this
+    // line exists to prevent. A valid token never trips it, so "quiet room, no
+    // output" still holds.
     const msg = `hub rejected the auth token (${res.status}). Check AUTH_TOKEN in ~/.claude.json or pass --url with a valid server.`;
     if (lastErrorMsg !== msg) {
-      console.error(`[groupmind-watch] ERROR: ${msg}`);
+      console.log(`[groupmind-watch] ERROR: ${msg}`);
       lastErrorMsg = msg;
     }
     return 0;
