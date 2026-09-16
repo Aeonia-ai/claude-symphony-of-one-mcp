@@ -863,6 +863,23 @@ function emitFileChange(room, operation, row, actor) {
   });
 }
 
+// Capability advertisement. Clients ask the hub what it supports rather than
+// each operator hand-setting a matching flag; a hub that lacks this endpoint is
+// treated as an older hub with no room file store.
+app.get("/api/capabilities", (req, res) => {
+  res.json({
+    protocolVersion: 1,
+    capabilities: {
+      roomFileStore: {
+        enabled: true,
+        maxTextBytes: MAX_TEXT_FILE_BYTES,
+        maxBinaryBytes: MAX_BINARY_FILE_BYTES,
+        authzMode: FILES_AUTHZ_MODE,
+      },
+    },
+  });
+});
+
 app.get("/api/rooms/:room/files", async (req, res) => {
   if (!requireFileRoom(req, res)) return;
   const prefix = req.query.prefix === undefined ? "" : normalizeLogicalPath(String(req.query.prefix).replace(/\/$/, ""));
