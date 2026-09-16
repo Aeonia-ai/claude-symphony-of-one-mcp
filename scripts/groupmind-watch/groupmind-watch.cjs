@@ -10,6 +10,7 @@
  *
  * Usage:
  *   node groupmind-watch.cjs [--room groupmind] [--interval 60]
+ *                            [--max-interval 600]
  *                            [--skip name,name] [--only name,name]
  *                            [--mentions-only] [--since ISO8601] [--debug]
  *
@@ -61,7 +62,16 @@ const url = args.url || process.env.CHAT_SERVER_URL || cfgEnv.CHAT_SERVER_URL;
 const token = process.env.AUTH_TOKEN || cfgEnv.AUTH_TOKEN || "";
 const me = args.me || process.env.AGENT_NAME || cfgEnv.AGENT_NAME || "";
 const room = args.room || process.env.SYMPHONY_ROOM || "groupmind";
-const intervalMs = Number(args.interval || 60) * 1000;
+const baseIntervalMs = Number(args.interval || 60) * 1000;
+// Idle backoff, off unless asked for. When --max-interval is set above
+// --interval, an idle room doubles the wait between polls up to that ceiling,
+// and ANY traffic drops it straight back to the base interval. The trade is
+// explicit: a quiet room costs fewer requests, and the first message after a
+// long silence waits up to --max-interval to be seen. Leave it unset and the
+// cadence is exactly as before.
+const maxIntervalMs = Number(args["max-interval"] || 0) * 1000;
+const backoffEnabled = maxIntervalMs > baseIntervalMs;
+let intervalMs = baseIntervalMs;
 const mentionsOnly = Boolean(args["mentions-only"]);
 const debug = Boolean(args.debug);
 
@@ -76,7 +86,7 @@ if (!url) {
 }
 
 if (debug) {
-  console.error(`[groupmind-watch] config: url=${url}, room=${room}, agent=${me || "(unset)"}, interval=${intervalMs / 1000}s, skip=[${[...skip].join(",")}], only=[${[...only].join(",")}]`);
+  console.error(`[groupmind-watch] config: url=${url}, room=${room}, agent=${me || "(unset)"}, interval=${baseIntervalMs / 1000}s, maxInterval=${backoffEnabled ? maxIntervalMs / 1000 + "s" : "(backoff off)"}, skip=[${[...skip].join(",")}], only=[${[...only].join(",")}]`);
 }
 
 let since = args.since || new Date().toISOString();
@@ -152,13 +162,20 @@ async function fetchPage() {
   return messages.length;
 }
 
+// Returns the number of messages seen, or null if the poll failed. The
+// distinction matters: a failed poll must not be read as an idle room, or a
+// broken connection would quietly slow its own recovery.
 async function poll() {
+  let seen = 0;
+  let failed = false;
   try {
     // A full page means there may be more behind it. The cursor is exclusive on
     // timestamp, so leaving a burst half-read risks dropping any message that
     // shares a timestamp with the last one seen.
     let drained = 0;
-    while ((await fetchPage()) === PAGE && ++drained < 20);
+    let page;
+    while ((page = await fetchPage()) === PAGE && ++drained < 20) seen += page;
+    seen += page;
   } catch (err) {
     const msg = `${err.name}: ${err.message}`;
     if (lastErrorMsg !== msg) {
@@ -166,6 +183,26 @@ async function poll() {
       lastErrorMsg = msg;
     }
     // Transient DNS/network blips are common; stay silent and retry next tick.
+    failed = true;
+  }
+  return failed ? null : seen;
+}
+
+// Any traffic at all resets the cadence, including messages that were filtered
+// out. A room full of bot chatter is an active room; sleeping through it would
+// mean the next message addressed to us waits out a long idle interval.
+function adjustInterval(seen) {
+  if (!backoffEnabled) return;
+  // A failed poll tells us nothing about whether the room is busy. Hold the
+  // current cadence rather than treating the failure as silence.
+  if (seen === null) {
+    if (debug) console.error(`[groupmind-watch] poll failed; holding interval at ${intervalMs / 1000}s`);
+    return;
+  }
+  const previous = intervalMs;
+  intervalMs = seen > 0 ? baseIntervalMs : Math.min(intervalMs * 2, maxIntervalMs);
+  if (debug && intervalMs !== previous) {
+    console.error(`[groupmind-watch] interval ${previous / 1000}s -> ${intervalMs / 1000}s (${seen > 0 ? "traffic, reset" : "idle, backing off"})`);
   }
 }
 
@@ -173,9 +210,12 @@ async function poll() {
 // overlap with the next tick, or two polls share one cursor and print the same
 // messages twice.
 async function loop() {
-  await poll();
+  adjustInterval(await poll());
   setTimeout(loop, intervalMs);
 }
 
-console.error(`[groupmind-watch] starting: polling ${room} every ${intervalMs / 1000}s`);
+console.error(
+  `[groupmind-watch] starting: polling ${room} every ${baseIntervalMs / 1000}s` +
+  (backoffEnabled ? `, backing off to ${maxIntervalMs / 1000}s while idle` : "")
+);
 loop();
