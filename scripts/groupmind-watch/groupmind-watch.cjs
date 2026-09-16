@@ -77,32 +77,55 @@ if (!url) {
 let since = args.since || new Date().toISOString();
 let quietFailures = 0;
 
+const PAGE = 50;
+
+// Returns how many messages the hub handed back, so a full page can be drained
+// immediately instead of waiting a whole interval for the remainder.
+async function fetchPage() {
+  const q = new URLSearchParams({ since, limit: String(PAGE) });
+  if (mentionsOnly && me) q.set("mentioning", me);
+  const res = await fetch(`${url}/api/messages/${encodeURIComponent(room)}?${q}`, {
+    headers: token ? { "x-auth-token": token } : {},
+  });
+  if (res.status === 401 || res.status === 403) {
+    // Worth surfacing once: a bad token looks like silence otherwise.
+    if (quietFailures++ === 0) console.log(`[groupmind-watch] hub rejected the auth token (${res.status}).`);
+    return 0;
+  }
+  if (!res.ok) return 0;
+  quietFailures = 0;
+  const data = await res.json();
+  const messages = data.messages || [];
+  for (const m of messages) {
+    // Advance before filtering: the cursor must pass over skipped messages too,
+    // or they are re-fetched forever.
+    since = m.timestamp;
+    const who = m.agentName;
+    if (skip.has(who)) continue;
+    if (only.size && !only.has(who)) continue;
+    console.log(`[${m.timestamp}] ${who}: ${m.content}`);
+  }
+  return messages.length;
+}
+
 async function poll() {
   try {
-    const q = new URLSearchParams({ since, limit: "50" });
-    if (mentionsOnly && me) q.set("mentioning", me);
-    const res = await fetch(`${url}/api/messages/${encodeURIComponent(room)}?${q}`, {
-      headers: token ? { "x-auth-token": token } : {},
-    });
-    if (res.status === 401 || res.status === 403) {
-      // Worth surfacing once: a bad token looks like silence otherwise.
-      if (quietFailures++ === 0) console.log(`[groupmind-watch] hub rejected the auth token (${res.status}).`);
-      return;
-    }
-    if (!res.ok) return;
-    quietFailures = 0;
-    const data = await res.json();
-    for (const m of data.messages || []) {
-      since = m.timestamp;
-      const who = m.agentName;
-      if (skip.has(who)) continue;
-      if (only.size && !only.has(who)) continue;
-      console.log(`[${m.timestamp}] ${who}: ${m.content}`);
-    }
+    // A full page means there may be more behind it. The cursor is exclusive on
+    // timestamp, so leaving a burst half-read risks dropping any message that
+    // shares a timestamp with the last one seen.
+    let drained = 0;
+    while ((await fetchPage()) === PAGE && ++drained < 20);
   } catch {
     // Transient DNS/network blips are common; stay silent and retry next tick.
   }
 }
 
-poll();
-setInterval(poll, intervalMs);
+// Self-scheduling rather than setInterval: a slow or stalled request must not
+// overlap with the next tick, or two polls share one cursor and print the same
+// messages twice.
+async function loop() {
+  await poll();
+  setTimeout(loop, intervalMs);
+}
+
+loop();
