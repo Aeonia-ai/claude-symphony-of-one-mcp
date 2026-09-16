@@ -585,7 +585,7 @@ async function loadDataFromDatabase() {
             // than only as agents happen to rejoin.
             const byKey = new Map();
             for (const row of agentRows) {
-              const key = `${(row.name || "").toLowerCase()} ${row.room}`;
+              const key = `${(row.name || "").toLowerCase()}\0${row.room}`;
               const prev = byKey.get(key);
               if (!prev || (row.last_active || "") > (prev.last_active || "")) {
                 if (prev) dbRun("DELETE FROM agents WHERE id = ?", [prev.id], `dedupe stale agent ${prev.id}`);
@@ -1125,6 +1125,13 @@ app.post("/api/join/:room", (req, res) => {
   // of room noise — 41% of messages in one active room. Check BEFORE mutating.
   const isRejoin = findAgentsByName(agentName).some((a) => a.room === roomName);
 
+  // Join-is-create is deliberate, but creating silently turns a typo into a new
+  // empty room indistinguishable from the one you meant — a leading space in a
+  // join string once produced "Group Space mind", and nothing said so. Report
+  // which of the two happened so the caller can notice before it starts
+  // talking to an empty room. Checked BEFORE getRoom(), which does the create.
+  const createdRoom = !rooms.has(roomName);
+
   const room = getRoom(roomName);
   room.agents.add(agentId);
 
@@ -1186,6 +1193,7 @@ app.post("/api/join/:room", (req, res) => {
     success: true,
     roomName,
     agentId,
+    createdRoom,
     currentAgents: Array.from(room.agents).map((id) => agents.get(id)),
   });
 });

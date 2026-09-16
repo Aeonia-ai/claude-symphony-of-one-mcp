@@ -15,6 +15,7 @@
     "start-wrapper": "node mcp-server-wrapper.js",
     "server": "node server.js",
     "cli": "node cli.js",
+    "cli:remote": "./bin/symphony-remote-cli",
     "demo": "node demo-enhanced-cli.js",
     "config": "node generate-config.js",
     "setup": "npm install && node setup.js",

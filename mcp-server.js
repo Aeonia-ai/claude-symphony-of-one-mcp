@@ -273,7 +273,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Successfully joined room: ${params.roomName}\nAgent ID: ${currentAgentId}\nAgent Name: ${agentName}\nCurrent Agents: ${response?.data?.currentAgents?.length ?? 0}`
+            text: `${response?.data?.createdRoom ? `NOTE: room "${params.roomName}" did not exist, so it was just created and you are its only member. If you meant to join an existing room, check the spelling with list_rooms — a typo here is silent and looks exactly like a quiet room.\n\n` : ""}Successfully joined room: ${params.roomName}\nAgent ID: ${currentAgentId}\nAgent Name: ${agentName}\nCurrent Agents: ${response?.data?.currentAgents?.length ?? 0}`
           }
         ]
       };

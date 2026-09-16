@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Launch the local Symphony CLI against the public hub without putting its
+# shared token in the repository or shell history. This helper is for
+# Weymouth, where symphony-hub.service owns the token.
+#
+# The hub URL is pinned deliberately. An ambient CHAT_SERVER_URL is IGNORED:
+# this script exports a live credential, and a stale `export
+# CHAT_SERVER_URL=http://localhost:3000` left in a shell profile would
+# otherwise ship the hub token to that origin in cleartext. To point
+# somewhere else, set SYMPHONY_HUB_URL explicitly; it must be https on the
+# tailnet or we refuse rather than leak the token.
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hub_url="https://weymouth.taile9e9a7.ts.net:10000"
+
+if [[ -n "${SYMPHONY_HUB_URL:-}" ]]; then
+  if [[ "${SYMPHONY_HUB_URL}" =~ ^https://[A-Za-z0-9-]+([.][A-Za-z0-9-]+)*[.]ts[.]net(:[0-9]+)?/?$ ]]; then
+    hub_url="${SYMPHONY_HUB_URL%/}"
+  else
+    echo "Refusing to send the hub token to '${SYMPHONY_HUB_URL}'." >&2
+    echo "SYMPHONY_HUB_URL must be an https:// URL on the tailnet (*.ts.net)." >&2
+    exit 1
+  fi
+fi
+
+service_env="$(systemctl --user show symphony-hub.service --property=Environment --value)"
+auth_token=""
+if [[ "${service_env}" =~ (^|[[:space:]])AUTH_TOKEN=([^[:space:]]+) ]]; then
+  auth_token="${BASH_REMATCH[2]}"
+fi
+
+if [[ -z "${auth_token}" ]]; then
+  echo "Could not read AUTH_TOKEN from symphony-hub.service." >&2
+  exit 1
+fi
+
+cd "${repo_dir}"
+export CHAT_SERVER_URL="${hub_url}"
+export AUTH_TOKEN="${auth_token}"
+exec node cli.js "$@"
