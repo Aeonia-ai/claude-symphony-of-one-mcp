@@ -12,6 +12,77 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.CHAT_SERVER_URL || "http://localhost:3000";
 const SHARED_DIR = process.env.SHARED_DIR || path.join(process.cwd(), "shared");
 const HUB_AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+// Which file store the file_* tools use is negotiated with the hub, not
+// configured per client. A hub that advertises roomFileStore gets room-scoped
+// hub storage; an older hub (or an unreachable one) falls back to the client's
+// local SHARED_DIR. SYMPHONY_FILE_BACKEND stays as an explicit override for
+// deliberate offline or single-machine use, and wins when set.
+const FILE_BACKEND_OVERRIDE = process.env.SYMPHONY_FILE_BACKEND || null;
+const CAPABILITY_TIMEOUT_MS = Number(process.env.SYMPHONY_CAPABILITY_TIMEOUT_MS || 3000);
+// A negative answer is re-probed so an upgraded hub is picked up without
+// restarting every client; a positive answer cannot change under us.
+const CAPABILITY_RETRY_MS = Number(process.env.SYMPHONY_CAPABILITY_RETRY_MS || 60_000);
+let cachedBackend = null;
+let cachedBackendAt = 0;
+let inFlightProbe = null;
+
+// A hub that rejects our credentials is a misconfiguration, not an old hub.
+// Falling back to local disk there would recreate the very bug this
+// negotiation exists to kill: files silently landing on one machine while the
+// operator believes they are shared.
+class HubRejectedClient extends Error {}
+
+export function resetFileBackendCache() {
+  cachedBackend = null;
+  cachedBackendAt = 0;
+  inFlightProbe = null;
+}
+
+async function hubAdvertisesFileStore() {
+  const headers = { Accept: "application/json" };
+  if (HUB_AUTH_TOKEN) headers["X-Auth-Token"] = HUB_AUTH_TOKEN;
+  const response = await fetch(`${SERVER_URL.replace(/\/$/, "")}/api/capabilities`, {
+    headers,
+    signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
+  });
+  if (response.status === 401 || response.status === 403) {
+    throw new HubRejectedClient(
+      `hub at ${SERVER_URL} rejected this client's credentials (HTTP ${response.status}). ` +
+      `Fix AUTH_TOKEN, or set SYMPHONY_FILE_BACKEND=local to deliberately work off the hub.`
+    );
+  }
+  // 404 and friends: a hub that predates capability advertisement.
+  if (!response.ok) return false;
+  const body = await response.json().catch(() => null);
+  return body?.capabilities?.roomFileStore?.enabled === true;
+}
+
+async function probeBackend() {
+  try {
+    return (await hubAdvertisesFileStore()) ? "remote" : "local";
+  } catch (error) {
+    if (error instanceof HubRejectedClient) throw error;
+    // Unreachable or pre-capability hub: keep working against local disk.
+    return "local";
+  }
+}
+
+export async function getFileBackend() {
+  if (FILE_BACKEND_OVERRIDE) return FILE_BACKEND_OVERRIDE;
+  if (cachedBackend === "remote") return cachedBackend;
+  if (cachedBackend && Date.now() - cachedBackendAt < CAPABILITY_RETRY_MS) return cachedBackend;
+  // Concurrent tool calls share one probe rather than each hitting the hub.
+  if (!inFlightProbe) {
+    inFlightProbe = probeBackend()
+      .then((backend) => {
+        cachedBackend = backend;
+        cachedBackendAt = Date.now();
+        return backend;
+      })
+      .finally(() => { inFlightProbe = null; });
+  }
+  return inFlightProbe;
+}
 // Set SYMPHONY_USE_MESSAGE_CACHE=true to use the local Socket.IO buffer for
 // get_messages instead of always fetching from the server. Faster for
 // single-agent local use; incorrect for multi-agent cross-machine coordination.
@@ -77,6 +148,27 @@ async function ensureSharedDir() {
     await fs.mkdir(SHARED_DIR, { recursive: true });
     console.error(`Created shared directory: ${SHARED_DIR}`);
   }
+}
+
+function remoteFileUrl(filename = "") {
+  if (!currentRoom) throw new Error("Not in a room. Use room_join first.");
+  const room = encodeURIComponent(currentRoom);
+  const suffix = filename
+    ? `/${filename.split("/").map(encodeURIComponent).join("/")}`
+    : "";
+  return `${SERVER_URL.replace(/\/$/, "")}/api/rooms/${room}/files${suffix}`;
+}
+
+async function remoteFileRequest(filename, options = {}) {
+  const headers = { "X-Agent-Name": agentName, ...(options.headers || {}) };
+  if (HUB_AUTH_TOKEN) headers["X-Auth-Token"] = HUB_AUTH_TOKEN;
+  const response = await fetch(remoteFileUrl(filename), { ...options, headers });
+  if (!response.ok) {
+    let detail = "";
+    try { const body = await response.json(); detail = body.error || body.code || ""; } catch { detail = await response.text(); }
+    throw new Error(`${response.status}${detail ? ` ${detail}` : ""}`);
+  }
+  return response;
 }
 
 // Create MCP server instance
@@ -1082,6 +1174,11 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if ((await getFileBackend()) === "remote") {
+        const response = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+        const file = await response.json();
+        return { content: [{ type: "text", text: `Content of ${file.path} (v${file.version}, ${file.byteSize} bytes, sha256 ${file.sha256}):\n\n${file.content}` }] };
+      }
       const filePath = path.join(SHARED_DIR, params.filename);
 
       // Security check - ensure file is within shared directory
@@ -1134,6 +1231,27 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if ((await getFileBackend()) === "remote") {
+        // Read first to obtain the version. A concurrent writer results in a
+        // clear conflict instead of a silent last-write-wins overwrite.
+        let version = null;
+        try {
+          const current = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+          version = (await current.json()).version;
+        } catch (error) {
+          if (!String(error.message).startsWith("404")) throw error;
+        }
+        const response = await remoteFileRequest(params.filename, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            ...(version === null ? { "If-None-Match": "*" } : { "If-Match": String(version) }),
+          },
+          body: params.content,
+        });
+        const { file } = await response.json();
+        return { content: [{ type: "text", text: `Shared file written: ${file.path} (v${file.version}, ${file.byteSize} bytes, sha256 ${file.sha256})` }] };
+      }
       const filePath = path.join(SHARED_DIR, params.filename);
 
       // Security check - ensure file is within shared directory
@@ -1185,6 +1303,18 @@ server.registerTool(
   },
   async (params) => {
     try {
+      if ((await getFileBackend()) === "remote") {
+        const query = params.subdirectory ? `?prefix=${encodeURIComponent(params.subdirectory)}` : "";
+        // remoteFileUrl() deliberately treats a filename as a path. Add the
+        // list query after construction so an optional prefix stays metadata.
+        const url = `${remoteFileUrl()}${query}`;
+        const headers = { Accept: "application/json", "X-Agent-Name": agentName, ...(HUB_AUTH_TOKEN ? { "X-Auth-Token": HUB_AUTH_TOKEN } : {}) };
+        const listed = await fetch(url, { headers });
+        if (!listed.ok) throw new Error(`${listed.status} ${(await listed.json().catch(() => ({}))).error || ""}`);
+        const { files } = await listed.json();
+        const lines = files.map((f) => `[FILE] ${f.path}  v${f.version}  ${f.byteSize} bytes  ${f.sha256}`).join("\n");
+        return { content: [{ type: "text", text: `Shared files in room "${currentRoom}" (hub store on ${SERVER_URL}):\n\n${lines || "No files found"}` }] };
+      }
       const targetDir = params.subdirectory
         ? path.join(SHARED_DIR, params.subdirectory)
         : SHARED_DIR;
@@ -1214,7 +1344,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Files in ${params.subdirectory || 'shared directory'}:\n\n${fileList || 'No files found'}`
+            text: `Files in ${params.subdirectory || 'shared directory'} (local to this machine: ${SHARED_DIR}; this hub advertises no room file store):\n\n${fileList || 'No files found'}`
           }
         ]
       };
@@ -1228,6 +1358,29 @@ server.registerTool(
         ],
         isError: true
       };
+    }
+  }
+);
+
+server.registerTool(
+  "file_delete",
+  {
+    title: "Delete File",
+    description: "Delete a file from the shared workspace. In remote mode this deletes the room-scoped shared file.",
+    inputSchema: { filename: z.string().describe("Name of the file to delete"), confirm: z.literal(true).describe("Explicit confirmation required") },
+  },
+  async (params) => {
+    try {
+      if ((await getFileBackend()) !== "remote") {
+        return { content: [{ type: "text", text: "file_delete needs the hub's room file store. This hub does not advertise one (or SYMPHONY_FILE_BACKEND=local is set), and local mode intentionally preserves the existing tool set." }], isError: true };
+      }
+      const current = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
+      const file = await current.json();
+      const response = await remoteFileRequest(params.filename, { method: "DELETE", headers: { "If-Match": String(file.version), "X-Confirm-Delete": "true" } });
+      const result = await response.json();
+      return { content: [{ type: "text", text: `Shared file deleted: ${result.file.path} (v${result.file.version})` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Failed to delete shared file: ${error.message}` }], isError: true };
     }
   }
 );
@@ -1251,9 +1404,23 @@ async function main() {
   console.error(`Starting Symphony of One MCP Server v1.0.0`);
   console.error(`Hub Server: ${SERVER_URL}`);
   console.error(`Agent Name: ${agentName}`);
-  console.error(`Shared Directory: ${SHARED_DIR}`);
-
-  await ensureSharedDir();
+  // A credentials rejection must not take the whole client down at boot; the
+  // file tools report it per call, and messaging surfaces its own auth errors.
+  const backend = await getFileBackend().catch((error) => {
+    console.error(`File Backend: undetermined — ${error.message}`);
+    return null;
+  });
+  if (backend) {
+    console.error(
+      `File Backend: ${backend}${FILE_BACKEND_OVERRIDE ? " (SYMPHONY_FILE_BACKEND override)" : " (negotiated with hub)"}`
+    );
+  }
+  if (backend === "local") {
+    console.error(`Shared Directory: ${SHARED_DIR} (this machine only)`);
+    await ensureSharedDir();
+  } else {
+    console.error(`Shared files: room-scoped on ${SERVER_URL}`);
+  }
 
   const stdioTransport = new StdioServerTransport();
   await server.connect(stdioTransport);

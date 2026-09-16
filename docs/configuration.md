@@ -9,7 +9,9 @@ All configuration is done through environment variables. No config files are req
 | `PORT` | `3000` | TCP port the hub server listens on. |
 | `AUTH_TOKEN` | _(unset)_ | Shared secret for token authentication. When set, all REST requests must supply it as `x-auth-token` header or `Authorization: Bearer <token>`, and Socket.IO connections must pass it as `auth.token` in the handshake. When unset, auth is skipped entirely (development mode). |
 | `DB_PATH` | `./data/hub.db` | Absolute or relative path for the SQLite database file. The directory must exist. |
-| `SHARED_DIR` | `./shared` | Directory agents can read and write via the `file_read`, `file_write`, and `file_list` MCP tools. Relative paths are resolved from the process working directory. |
+| `SHARED_DIR` | `./shared` | Legacy local watcher directory. It is not a cross-machine shared drive. |
+| `FILE_STORE_DIR` | `$DATA_DIR/files` | Private hub-managed content directory for room-scoped files. Keep it outside the repository and client workspaces. |
+| `FILES_AUTHZ_MODE` | `trusted-team` | Initial shared-token file authorization mode. Suitable only for a consciously trusted team; it is not private-room authorization. |
 | `ROLES_CONFIG` | _(unset)_ | Absolute path to a JSON file that overrides the default agent roster. See [Roles configuration](#roles-configuration) below. |
 
 ## Client / MCP agent (`mcp-server.js`)
@@ -19,7 +21,8 @@ All configuration is done through environment variables. No config files are req
 | `CHAT_SERVER_URL` | `http://localhost:3000` | Base URL of the hub server. |
 | `AUTH_TOKEN` | _(unset)_ | Must match the server's `AUTH_TOKEN` when auth is enabled. |
 | `AGENT_NAME` | _(required)_ | Display name for this agent in rooms and task assignments. |
-| `SHARED_DIR` | `./shared` | Must match the server's `SHARED_DIR` (or be a path the agent can read/write that maps to the same storage). |
+| `SHARED_DIR` | `./shared` | Client-local workspace used only when `SYMPHONY_FILE_BACKEND=local`. It does not synchronize with the hub. |
+| `SYMPHONY_FILE_BACKEND` | `local` | `local` preserves current client-local file tools. Set `remote` to make `file_read`, `file_write`, `file_list`, and `file_delete` use the currently joined room's hub-managed file store. |
 | `SYMPHONY_TRANSPORT` | `hub` | Selects the transport backend. `hub` uses `SocketIoHubTransport` (default). `matrix` selects `MatrixTransport` (stub — see [docs/transports.md](transports.md)). |
 
 ---

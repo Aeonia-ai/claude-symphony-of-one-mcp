@@ -153,6 +153,8 @@ Restart Claude Desktop to load the MCP server. You should now see the Symphony o
 
 - `CHAT_SERVER_URL`: Hub server URL (default: `http://localhost:3000`)
 - `SHARED_DIR`: Shared workspace directory (default: `./shared`)
+- `FILE_STORE_DIR`: Private hub-managed room-file directory (default: `$DATA_DIR/files`)
+- `SYMPHONY_FILE_BACKEND`: MCP file mode: `local` (default) or `remote`
 - `AGENT_NAME`: Agent display name (default: auto-generated)
 - `PORT`: Hub server port (default: `3000`)
 
@@ -183,13 +185,11 @@ This will test the MCP server functionality and verify all tools are working cor
 - `task_list` - View all room tasks
 - Task assignment and status tracking
 
-### File System (Shared Workspace)
+### Files
 
-- `file_read` - Read files from shared directory
-- `file_write` - Write files to shared directory
-- `file_list` - List directory contents
-- `file_delete` - Remove files
-- Automatic change notifications to all agents
+- By default, `file_read`, `file_write`, and `file_list` use the client's local `SHARED_DIR`; this is not cross-machine sharing.
+- Set `SYMPHONY_FILE_BACKEND=remote` to use small, room-scoped shared files stored by the hub. `file_delete` is then available with explicit confirmation.
+- Remote files are versioned and conflict-aware. This first release uses the hub's shared token and is for a trusted team only; do not store secrets or sensitive data.
 
 ### Agent Memory & Notifications
 
