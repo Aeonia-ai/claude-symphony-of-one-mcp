@@ -21,13 +21,21 @@ const FILE_BACKEND_OVERRIDE = process.env.SYMPHONY_FILE_BACKEND || null;
 const CAPABILITY_TIMEOUT_MS = Number(process.env.SYMPHONY_CAPABILITY_TIMEOUT_MS || 3000);
 // A negative answer is re-probed so an upgraded hub is picked up without
 // restarting every client; a positive answer cannot change under us.
-const CAPABILITY_RETRY_MS = 60_000;
+const CAPABILITY_RETRY_MS = Number(process.env.SYMPHONY_CAPABILITY_RETRY_MS || 60_000);
 let cachedBackend = null;
 let cachedBackendAt = 0;
+let inFlightProbe = null;
+
+// A hub that rejects our credentials is a misconfiguration, not an old hub.
+// Falling back to local disk there would recreate the very bug this
+// negotiation exists to kill: files silently landing on one machine while the
+// operator believes they are shared.
+class HubRejectedClient extends Error {}
 
 export function resetFileBackendCache() {
   cachedBackend = null;
   cachedBackendAt = 0;
+  inFlightProbe = null;
 }
 
 async function hubAdvertisesFileStore() {
@@ -37,24 +45,43 @@ async function hubAdvertisesFileStore() {
     headers,
     signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
   });
+  if (response.status === 401 || response.status === 403) {
+    throw new HubRejectedClient(
+      `hub at ${SERVER_URL} rejected this client's credentials (HTTP ${response.status}). ` +
+      `Fix AUTH_TOKEN, or set SYMPHONY_FILE_BACKEND=local to deliberately work off the hub.`
+    );
+  }
+  // 404 and friends: a hub that predates capability advertisement.
   if (!response.ok) return false;
-  const body = await response.json();
+  const body = await response.json().catch(() => null);
   return body?.capabilities?.roomFileStore?.enabled === true;
+}
+
+async function probeBackend() {
+  try {
+    return (await hubAdvertisesFileStore()) ? "remote" : "local";
+  } catch (error) {
+    if (error instanceof HubRejectedClient) throw error;
+    // Unreachable or pre-capability hub: keep working against local disk.
+    return "local";
+  }
 }
 
 export async function getFileBackend() {
   if (FILE_BACKEND_OVERRIDE) return FILE_BACKEND_OVERRIDE;
   if (cachedBackend === "remote") return cachedBackend;
   if (cachedBackend && Date.now() - cachedBackendAt < CAPABILITY_RETRY_MS) return cachedBackend;
-  let backend = "local";
-  try {
-    if (await hubAdvertisesFileStore()) backend = "remote";
-  } catch {
-    // Unreachable or pre-capability hub: keep working against local disk.
+  // Concurrent tool calls share one probe rather than each hitting the hub.
+  if (!inFlightProbe) {
+    inFlightProbe = probeBackend()
+      .then((backend) => {
+        cachedBackend = backend;
+        cachedBackendAt = Date.now();
+        return backend;
+      })
+      .finally(() => { inFlightProbe = null; });
   }
-  cachedBackend = backend;
-  cachedBackendAt = Date.now();
-  return backend;
+  return inFlightProbe;
 }
 // Set SYMPHONY_USE_MESSAGE_CACHE=true to use the local Socket.IO buffer for
 // get_messages instead of always fetching from the server. Faster for
@@ -1311,10 +1338,10 @@ server.registerTool(
     inputSchema: { filename: z.string().describe("Name of the file to delete"), confirm: z.literal(true).describe("Explicit confirmation required") },
   },
   async (params) => {
-    if ((await getFileBackend()) !== "remote") {
-      return { content: [{ type: "text", text: "file_delete needs the hub's room file store. This hub does not advertise one (or SYMPHONY_FILE_BACKEND=local is set), and local mode intentionally preserves the existing tool set." }], isError: true };
-    }
     try {
+      if ((await getFileBackend()) !== "remote") {
+        return { content: [{ type: "text", text: "file_delete needs the hub's room file store. This hub does not advertise one (or SYMPHONY_FILE_BACKEND=local is set), and local mode intentionally preserves the existing tool set." }], isError: true };
+      }
       const current = await remoteFileRequest(params.filename, { headers: { Accept: "application/json" } });
       const file = await current.json();
       const response = await remoteFileRequest(params.filename, { method: "DELETE", headers: { "If-Match": String(file.version), "X-Confirm-Delete": "true" } });
@@ -1345,10 +1372,17 @@ async function main() {
   console.error(`Starting Symphony of One MCP Server v1.0.0`);
   console.error(`Hub Server: ${SERVER_URL}`);
   console.error(`Agent Name: ${agentName}`);
-  const backend = await getFileBackend();
-  console.error(
-    `File Backend: ${backend}${FILE_BACKEND_OVERRIDE ? " (SYMPHONY_FILE_BACKEND override)" : " (negotiated with hub)"}`
-  );
+  // A credentials rejection must not take the whole client down at boot; the
+  // file tools report it per call, and messaging surfaces its own auth errors.
+  const backend = await getFileBackend().catch((error) => {
+    console.error(`File Backend: undetermined — ${error.message}`);
+    return null;
+  });
+  if (backend) {
+    console.error(
+      `File Backend: ${backend}${FILE_BACKEND_OVERRIDE ? " (SYMPHONY_FILE_BACKEND override)" : " (negotiated with hub)"}`
+    );
+  }
   if (backend === "local") {
     console.error(`Shared Directory: ${SHARED_DIR} (this machine only)`);
     await ensureSharedDir();

@@ -77,17 +77,45 @@ describe("file backend negotiation", () => {
     }
   });
 
-  it("falls back to local disk against an older hub with no capabilities endpoint", async () => {
+  it("falls back to working local disk against an older hub with no capabilities endpoint", async () => {
     const hub = await stubHub((req, res) => { res.statusCode = 404; res.end("Cannot GET"); });
     const clientDir = path.join(os.tmpdir(), `legacy-local-${randomUUID()}`);
     const client = await connectClient({ hubUrl: hub.url, sharedDir: clientDir });
     try {
+      const written = await client.callTool({ name: "file_write", arguments: { filename: "fallback.md", content: "written locally" } });
+      assert.ok(!written.isError, textOf(written));
+
+      // The fallback has to actually work, not merely claim to: the bytes must
+      // be on this machine's disk where the operator can find them.
+      assert.equal(await fs.readFile(path.join(clientDir, "fallback.md"), "utf8"), "written locally");
+
+      const read = await client.callTool({ name: "file_read", arguments: { filename: "fallback.md" } });
+      assert.match(textOf(read), /written locally/);
+
       const listed = await client.callTool({ name: "file_list", arguments: {} });
-      assert.ok(!listed.isError, textOf(listed));
+      assert.match(textOf(listed), /fallback\.md/);
       assert.match(textOf(listed), /local to this machine/, "listing should say it fell back to local disk");
     } finally {
       await client.close();
       await hub.stop();
+      await fs.rm(clientDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to quietly use local disk when the hub rejects our credentials", async () => {
+    const clientDir = path.join(os.tmpdir(), `rejected-${randomUUID()}`);
+    const client = await connectClient({
+      hubUrl: `http://localhost:${srv.port}`, sharedDir: clientDir, token: "wrong-token",
+    });
+    try {
+      const listed = await client.callTool({ name: "file_list", arguments: {} });
+      assert.ok(listed.isError, "a rejected token must surface, not silently fall back");
+      assert.match(textOf(listed), /rejected this client's credentials/);
+      assert.match(textOf(listed), /AUTH_TOKEN/, "the error should say how to fix it");
+      // Silently writing to this machine is the exact bug being prevented.
+      await assert.rejects(fs.access(path.join(clientDir, "anything")));
+    } finally {
+      await client.close();
       await fs.rm(clientDir, { recursive: true, force: true });
     }
   });
@@ -121,6 +149,66 @@ describe("file backend negotiation", () => {
       assert.match(textOf(listed), /local to this machine/, "override must win over the hub's advertisement");
     } finally {
       await client.close();
+      await fs.rm(clientDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("capability probe caching", () => {
+  // Counts probes so the caching claims are measured, not assumed.
+  async function countingHub({ enabled }) {
+    let probes = 0;
+    const server = http.createServer((req, res) => {
+      if (req.url === "/api/capabilities") probes += 1;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ protocolVersion: 1, capabilities: enabled ? { roomFileStore: { enabled: true } } : {} }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return {
+      url: `http://127.0.0.1:${server.address().port}`,
+      probes: () => probes,
+      stop: () => new Promise((resolve) => server.close(resolve)),
+    };
+  }
+
+  it("asks a capable hub once, however many file calls follow", async () => {
+    const hub = await countingHub({ enabled: true });
+    const clientDir = path.join(os.tmpdir(), `cache-positive-${randomUUID()}`);
+    const client = await connectClient({ hubUrl: hub.url, sharedDir: clientDir });
+    try {
+      await client.callTool({ name: "room_join", arguments: { roomName: `cache-${randomUUID().slice(0, 8)}` } });
+      // These fail (the stub serves no file routes); only the probe count matters.
+      await Promise.all([
+        client.callTool({ name: "file_list", arguments: {} }),
+        client.callTool({ name: "file_list", arguments: {} }),
+        client.callTool({ name: "file_list", arguments: {} }),
+      ]);
+      assert.equal(hub.probes(), 1, "a positive answer should be cached for the process lifetime");
+    } finally {
+      await client.close();
+      await hub.stop();
+      await fs.rm(clientDir, { recursive: true, force: true });
+    }
+  });
+
+  it("re-asks a hub that had no file store, so an upgrade is picked up", async () => {
+    const hub = await countingHub({ enabled: false });
+    const clientDir = path.join(os.tmpdir(), `cache-negative-${randomUUID()}`);
+    const client = await connectClient({
+      hubUrl: hub.url, sharedDir: clientDir,
+      extraEnv: { SYMPHONY_CAPABILITY_RETRY_MS: "50" },
+    });
+    try {
+      await client.callTool({ name: "file_list", arguments: {} });
+      const afterFirst = hub.probes();
+      await client.callTool({ name: "file_list", arguments: {} });
+      assert.equal(hub.probes(), afterFirst, "within the retry window the answer is reused");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await client.callTool({ name: "file_list", arguments: {} });
+      assert.ok(hub.probes() > afterFirst, "after the retry window the hub is asked again");
+    } finally {
+      await client.close();
+      await hub.stop();
       await fs.rm(clientDir, { recursive: true, force: true });
     }
   });
