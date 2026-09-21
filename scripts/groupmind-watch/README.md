@@ -66,6 +66,7 @@ Your own messages and the `System` join/leave notices are dropped by default.
 | `--mentions-only` | Only messages that @mention you |
 | `--interval N` | Seconds between polls (default 60) |
 | `--max-interval N` | Back off to this many seconds while the room is idle (default: off) |
+| `--request-timeout N` | Give up on a single request to the hub after N seconds (default 30) |
 | `--since ISO` | Start from a past timestamp instead of now |
 
 **Set `--me` explicitly.** It defaults to `AGENT_NAME` from the MCP config, which
@@ -105,6 +106,15 @@ Two details that are deliberate:
 A `401`/`403` is reported once — a bad token should not be indistinguishable
 from a quiet room. Transient DNS failures and hub restarts are silent and
 retried on the next tick.
+
+A request that neither succeeds nor fails — a connection that simply goes
+quiet, as happens when Wi-Fi drops, the machine sleeps, or the hub restarts
+mid-request — is abandoned after `--request-timeout` seconds and treated as an
+ordinary failed poll. Without that limit, one stalled request would stop the
+watcher permanently while the process still looked healthy: no output, no CPU, no
+errors. That is indistinguishable from a quiet room, which is the worst way for a
+watcher to fail. This matters most for long-running supervision (launchd,
+systemd), where nothing restarts the process for you.
 
 ## Limits
 

@@ -10,7 +10,7 @@
  *
  * Usage:
  *   node groupmind-watch.cjs [--room groupmind] [--interval 60]
- *                            [--max-interval 600]
+ *                            [--max-interval 600] [--request-timeout 30]
  *                            [--skip name,name] [--only name,name]
  *                            [--mentions-only] [--since ISO8601] [--debug]
  *
@@ -78,6 +78,14 @@ const baseIntervalMs = seconds(args.interval, 60) * 1000;
 // long silence waits up to --max-interval to be seen. Leave it unset and the
 // cadence is exactly as before.
 const maxIntervalMs = seconds(args["max-interval"], 0) * 1000;
+// Every request to the hub gives up after this long. Without it, a connection
+// that goes quiet rather than failing — a Wi-Fi blip, the Mac sleeping, the hub
+// restarting mid-request — makes fetch wait forever. And because the loop only
+// schedules the next poll after the current one returns, one stalled request
+// stops the watcher for good while the process still looks perfectly healthy:
+// silent, no CPU, no errors — indistinguishable from a quiet room. A timeout
+// turns that into an ordinary failed poll, which is already handled.
+const requestTimeoutMs = seconds(args["request-timeout"], 30) * 1000;
 const backoffEnabled = maxIntervalMs > baseIntervalMs;
 let intervalMs = baseIntervalMs;
 const mentionsOnly = Boolean(args["mentions-only"]);
@@ -116,6 +124,7 @@ async function fetchPage() {
 
   const res = await fetch(`${url}/api/messages/${encodeURIComponent(room)}?${q}`, {
     headers: token ? { "x-auth-token": token } : {},
+    signal: AbortSignal.timeout(requestTimeoutMs),
   });
 
   if (res.status === 401 || res.status === 403) {
