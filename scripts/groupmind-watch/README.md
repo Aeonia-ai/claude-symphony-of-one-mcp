@@ -78,9 +78,15 @@ bulk of room traffic and none of the signal.
 
 ## Idle backoff
 
-Off unless you ask for it. Set `--max-interval` above `--interval` and a quiet
-room doubles the wait between polls up to that ceiling; any traffic drops it
-straight back to the base interval.
+Off unless you ask for it. Set `--max-interval` above `--interval` and, once the
+room has been quiet for five consecutive polls (about five minutes at the default
+interval), the wait between polls doubles each time up to that ceiling. Any
+traffic drops it straight back to the base interval and restarts the count.
+
+The grace period is deliberate: the first poll after startup is always empty,
+because the watcher only looks for messages from the moment it started. Backing
+off on that would make every restart begin slow, having learned nothing about
+whether the room is actually idle.
 
 ```bash
 node groupmind-watch.cjs --me you --interval 60 --max-interval 600

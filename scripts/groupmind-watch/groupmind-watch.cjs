@@ -88,6 +88,13 @@ const maxIntervalMs = seconds(args["max-interval"], 0) * 1000;
 const requestTimeoutMs = seconds(args["request-timeout"], 30) * 1000;
 const backoffEnabled = maxIntervalMs > baseIntervalMs;
 let intervalMs = baseIntervalMs;
+// "Idle" has to mean idle for a while, not one quiet poll. The first poll after
+// startup is empty by construction — the cursor starts at "now" — so counting it
+// would make every restart begin backed off, having learned nothing about the
+// room. Backoff therefore waits for this many consecutive empty polls (about five
+// minutes at the default interval) before it starts slowing down.
+const IDLE_POLLS_BEFORE_BACKOFF = 5;
+let consecutiveEmpty = 0;
 const mentionsOnly = Boolean(args["mentions-only"]);
 const debug = Boolean(args.debug);
 
@@ -226,7 +233,12 @@ function adjustInterval(seen) {
     return;
   }
   const previous = intervalMs;
-  intervalMs = seen > 0 ? baseIntervalMs : Math.min(intervalMs * 2, maxIntervalMs);
+  if (seen > 0) {
+    consecutiveEmpty = 0;
+    intervalMs = baseIntervalMs;
+  } else if (++consecutiveEmpty >= IDLE_POLLS_BEFORE_BACKOFF) {
+    intervalMs = Math.min(intervalMs * 2, maxIntervalMs);
+  }
   if (debug && intervalMs !== previous) {
     console.error(`[groupmind-watch] interval ${previous / 1000}s -> ${intervalMs / 1000}s (${seen > 0 ? "traffic, reset" : "idle, backing off"})`);
   }
