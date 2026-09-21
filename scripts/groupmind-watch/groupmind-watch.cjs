@@ -140,7 +140,7 @@ async function fetchPage() {
       console.log(`[groupmind-watch] ERROR: ${msg}`);
       lastErrorMsg = msg;
     }
-    return 0;
+    return null;
   }
 
   if (!res.ok) {
@@ -149,7 +149,7 @@ async function fetchPage() {
       console.error(`[groupmind-watch] ERROR: ${msg}`);
       lastErrorMsg = msg;
     }
-    return 0;
+    return null;
   }
 
   lastErrorMsg = "";
@@ -189,10 +189,17 @@ async function poll() {
     // A full page means there may be more behind it. The cursor is exclusive on
     // timestamp, so leaving a burst half-read risks dropping any message that
     // shares a timestamp with the last one seen.
+    // fetchPage returns a count on success and null on an HTTP error. Zero and
+    // null mean different things — "the room is quiet" versus "we could not
+    // tell" — and conflating them made a hub answering 502 during a restart
+    // look idle, so backoff slowed the very recovery it should have waited out.
     let drained = 0;
-    let page;
-    while ((page = await fetchPage()) === PAGE && ++drained < 20) seen += page;
-    seen += page;
+    for (;;) {
+      const page = await fetchPage();
+      if (page === null) { failed = true; break; }
+      seen += page;
+      if (page !== PAGE || ++drained >= 20) break;
+    }
   } catch (err) {
     const msg = `${err.name}: ${err.message}`;
     if (lastErrorMsg !== msg) {
