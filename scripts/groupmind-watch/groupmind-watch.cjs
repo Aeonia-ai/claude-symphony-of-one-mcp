@@ -12,7 +12,7 @@
  *   node groupmind-watch.cjs [--room groupmind] [--interval 60]
  *                            [--max-interval 600] [--request-timeout 30]
  *                            [--skip name,name] [--only name,name]
- *                            [--mentions-only] [--since ISO8601] [--debug]
+ *                            [--mentions-only] [--since CURSOR] [--debug]
  *
  * Config resolution (first hit wins):
  *   1. CLI flags
@@ -168,7 +168,7 @@ async function fetchPage() {
   for (const m of messages) {
     // Advance before filtering: the cursor must pass over skipped messages too,
     // or they are re-fetched forever.
-    since = m.timestamp;
+    if (typeof data.nextSince !== "string" || !data.nextSince) since = m.timestamp;
     const who = m.agentName;
     if (skip.has(who)) {
       if (debug) console.error(`[groupmind-watch] skipping ${who}: in skip list`);
@@ -183,6 +183,9 @@ async function fetchPage() {
 
   if (debug && messages.length === 0) console.error(`[groupmind-watch] no new messages`);
 
+  // Server cursors can be opaque Matrix event cursors. Keep them verbatim,
+  // including after an empty page; timestamps are only for older hub versions.
+  if (typeof data.nextSince === "string" && data.nextSince) since = data.nextSince;
   return messages.length;
 }
 
@@ -193,9 +196,8 @@ async function poll() {
   let seen = 0;
   let failed = false;
   try {
-    // A full page means there may be more behind it. The cursor is exclusive on
-    // timestamp, so leaving a burst half-read risks dropping any message that
-    // shares a timestamp with the last one seen.
+    // A full page may have more behind it. Drain using the returned cursor;
+    // Matrix event cursors also distinguish messages sharing one timestamp.
     // fetchPage returns a count on success and null on an HTTP error. Zero and
     // null mean different things — "the room is quiet" versus "we could not
     // tell" — and conflating them made a hub answering 502 during a restart
