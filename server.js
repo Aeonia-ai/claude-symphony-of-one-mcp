@@ -10,6 +10,8 @@ import crypto from "crypto";
 import chokidar from "chokidar";
 import sqlite3 from "sqlite3";
 import winston from "winston";
+import { MatrixBackend } from "./matrix-backend.js";
+const matrix = new MatrixBackend();
 
 const app = express();
 const httpServer = createServer(app);
@@ -671,9 +673,11 @@ async function createNotifications(message, mentions) {
   // db.run callback with nothing to catch it — i.e. it kills the process.
   const preview = String(message.content ?? "").substring(0, 100);
   const notifications = mentions.map((mentionedName) => {
-    const agent = findAgentByName(mentionedName);
+    const agent = MatrixBackend.isMatrixRoom(message.room)
+      ? findAgentsByName(mentionedName).find(a => a.room === message.room) : findAgentByName(mentionedName);
     return {
-      id: uuidv4(),
+      id: MatrixBackend.isMatrixRoom(message.room)
+        ? crypto.createHash('sha256').update(`${message.room}\0${message.id}\0${mentionedName.toLowerCase()}`).digest('hex') : uuidv4(),
       agent_id: agent?.id || null,
       agent_name: mentionedName,
       room: message.room,
@@ -682,11 +686,24 @@ async function createNotifications(message, mentions) {
       created_at: new Date().toISOString(),
     };
   });
+  if (MatrixBackend.isMatrixRoom(message.room)) {
+    await Promise.all(notifications.map(notification => new Promise((resolve,reject) => {
+      db.run("INSERT OR IGNORE INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [notification.id,notification.agent_id,notification.agent_name,notification.room,notification.message,notification.type,notification.created_at],
+        function(err) {
+          if (err) return reject(err);
+          const target = agents.get(notification.agent_id);
+          if (this.changes && target?.socketId) io.to(target.socketId).emit('notification',notification);
+          resolve();
+        });
+    })));
+    return notifications;
+  }
   // Persist all notifications — even for agents not currently online.
   // Agents joining later will fetch by name from the server.
   notifications.forEach((notification) => {
     dbRun(
-      "INSERT INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO notifications (id, agent_id, agent_name, room, message, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         notification.id,
         notification.agent_id,
@@ -834,7 +851,7 @@ function getRoom(roomName) {
     };
     rooms.set(roomName, room);
     messages.set(roomName, []);
-    setupFileWatcher(roomName);
+    if (!MatrixBackend.isMatrixRoom(roomName)) setupFileWatcher(roomName);
 
     // Persist to database
     dbRun(
@@ -1099,9 +1116,60 @@ app.delete("/api/rooms/:room/files/*", async (req, res) => {
   });
 });
 
+// Matrix is a room backend, not a model or command dispatcher. The existing
+// Embassy container owns activation credentials; clients keep hub authentication.
+function matrixFailure(res, err) {
+  return res.status(err.status >= 400 && err.status < 500 ? err.status : 502).json({success:false,code:err.code || 'MATRIX_BACKEND_ERROR',error:err.message,
+    ...(err.ambiguous ? {ambiguous:true,transactionId:err.transactionId,delivery:'unknown; retry only with this transactionId and identical content'} : {})});
+}
+const matrixSyncPath = process.env.SYMPHONY_MATRIX_SYNC_STATE || `${DB_PATH}.matrix-sync.json`;
+let matrixSyncStopped = false;
+async function runMatrixSync() {
+  let since, failures = 0;
+  const delivered = new Set();
+  try { since = JSON.parse(await fs.readFile(matrixSyncPath,'utf8')).since; }
+  catch (err) { if (err.code !== 'ENOENT') logger.warn('Matrix sync checkpoint unavailable; history remains available from Matrix'); }
+  while (!matrixSyncStopped) {
+    try {
+      const batch = await matrix.sync({since});
+      if (typeof batch.next_batch !== 'string') throw new Error('Matrix sync returned no cursor');
+      // First sync establishes a baseline, rather than announcing old history.
+      if (since) for (const [roomId, data] of Object.entries(batch.rooms?.join || {})) {
+        const roomName = `matrix:${roomId}`;
+        if (!rooms.has(roomName)) continue;
+        if (data.timeline?.limited) io.to(roomName).emit('notification',{
+          type:'matrix_history_gap', room:roomName, message:'Matrix live updates have a gap. Read get_messages with your saved cursor to recover history.'
+        });
+        for (const event of data.timeline?.events || []) {
+          const message = matrix.normalizeEvent(roomId,event);
+          if (!message || delivered.has(message.id)) continue;
+          if (message.mentions.length) await createNotifications(message,message.mentions);
+          io.to(roomName).emit('message',message);
+          delivered.add(message.id);
+          if (delivered.size > 5000) delivered.delete(delivered.values().next().value);
+        }
+      }
+      const temp = `${matrixSyncPath}.tmp`;
+      await fs.writeFile(temp,JSON.stringify({since:batch.next_batch}),{mode:0o600});
+      await fs.rename(temp,matrixSyncPath);
+      since = batch.next_batch;
+      failures = 0;
+    } catch (err) {
+      if (err.matrixCode === 'M_UNKNOWN_POS') {
+        since = undefined;
+        for (const roomName of rooms.keys()) if (MatrixBackend.isMatrixRoom(roomName)) io.to(roomName).emit('notification',{
+          type:'matrix_history_gap',room:roomName,message:'Matrix live cursor expired. Read get_messages to recover history.'
+        });
+      }
+      logger.warn(`Matrix sync unavailable (${err.matrixCode || err.code || err.status || 'network/checkpoint'}); retrying. History reads report their own errors.`);
+      await new Promise(resolve => setTimeout(resolve,Math.min(30000,2000 * 2 ** Math.min(failures++,4))));
+    }
+  }
+}
+
 // HTTP API Endpoints
-app.post("/api/join/:room", (req, res) => {
-  const { room: roomName } = req.params;
+app.post("/api/join/:room", async (req, res) => {
+  let { room: roomName } = req.params;
   const { agentId, agentName, capabilities = {} } = req.body;
 
   // Reject a join that cannot produce a usable agent record. Without this an
@@ -1118,6 +1186,14 @@ app.post("/api/join/:room", (req, res) => {
     });
   }
 
+  const matrixRoom = roomName.startsWith("matrix:");
+  if (matrixRoom) {
+    try {
+      const joined = await matrix.joinRoom(roomName);
+      roomName = joined.name;
+    } catch (err) { return matrixFailure(res, err); }
+  }
+
   // Is this name ALREADY in the room? If so this is a re-join (agents get a
   // fresh id every session), not a genuine arrival, and we suppress the
   // "has joined" announcement. Autonomous workers re-join every cycle and
@@ -1130,7 +1206,7 @@ app.post("/api/join/:room", (req, res) => {
   // join string once produced "Group Space mind", and nothing said so. Report
   // which of the two happened so the caller can notice before it starts
   // talking to an empty room. Checked BEFORE getRoom(), which does the create.
-  const createdRoom = !rooms.has(roomName);
+  const createdRoom = !matrixRoom && !rooms.has(roomName);
 
   const room = getRoom(roomName);
   room.agents.add(agentId);
@@ -1167,7 +1243,7 @@ app.post("/api/join/:room", (req, res) => {
   );
 
   // Announce only genuine first arrivals, not every session re-join.
-  if (!isRejoin) {
+  if (!isRejoin && !matrixRoom) {
     const joinMessage = {
       id: uuidv4(),
       type: "system",
@@ -1207,8 +1283,8 @@ app.post("/api/leave/:agentId", (req, res) => {
   }
 
   const room = rooms.get(agent.room);
-  if (room) {
-    room.agents.delete(agentId);
+  if (room) room.agents.delete(agentId);
+  if (room && !MatrixBackend.isMatrixRoom(agent.room)) {
 
     const leaveMessage = {
       id: uuidv4(),
@@ -1241,7 +1317,7 @@ app.post("/api/leave/:agentId", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/send", (req, res) => {
+app.post("/api/send", async (req, res) => {
   const { agentId, content, metadata = {} } = req.body;
 
   // Validate BEFORE any lookup or write. A non-string `content` used to be
@@ -1260,6 +1336,18 @@ app.post("/api/send", (req, res) => {
 
   if (!agent) {
     return res.status(404).json({ success: false, error: "Agent not registered — your session may have been replaced by a newer one or cleared on a restart. Call room_join to re-register, then retry.", code: "AGENT_NOT_REGISTERED" });
+  }
+
+  if (MatrixBackend.isMatrixRoom(agent.room)) {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      return res.status(400).json({success:false,error:'metadata must be an object'});
+    }
+    try {
+      const message = await matrix.sendMessage(agent.room, { agentId, agentName:agent.name, content, metadata });
+      agent.lastActive = new Date().toISOString();
+      dbRun("UPDATE agents SET last_active = ? WHERE id = ?",[agent.lastActive,agentId],`Matrix heartbeat ${agentId}`);
+      return res.json({success:true,messageId:message.id,mentions:message.mentions,backend:'matrix'});
+    } catch (err) { return matrixFailure(res, err); }
   }
 
   // Parse mentions from content
@@ -1444,9 +1532,14 @@ function mentionsName(m, name) {
   return Array.isArray(m.mentions) && m.mentions.some((x) => String(x).toLowerCase() === lower);
 }
 
-app.get("/api/messages/:room", (req, res) => {
+app.get("/api/messages/:room", async (req, res) => {
   const { room } = req.params;
   const { since, limit = 100, mentioning } = req.query;
+
+  if (room.startsWith('matrix:')) {
+    try { return res.json(await matrix.getMessages(room, {since,limit:Number(limit),mentioning})); }
+    catch (err) { return matrixFailure(res, err); }
+  }
 
   let sinceTime = null;
   if (since) {
@@ -1522,8 +1615,8 @@ app.get("/api/messages/:room", (req, res) => {
   );
 });
 
-app.get("/api/rooms", (req, res) => {
-  const roomList = Array.from(rooms.entries()).map(([name, room]) => ({
+app.get("/api/rooms", async (req, res) => {
+  const roomList = Array.from(rooms.entries()).filter(([name]) => !MatrixBackend.isMatrixRoom(name)).map(([name, room]) => ({
     name,
     agentCount: room.agents.size,
     agents: Array.from(room.agents)
@@ -1532,6 +1625,17 @@ app.get("/api/rooms", (req, res) => {
     createdAt: room.createdAt,
   }));
 
+  if (matrix.enabled) {
+    try {
+      for (const descriptor of await matrix.listRooms()) {
+        const local = rooms.get(descriptor.name);
+        const activeAgents = [...(local?.agents || [])].map(id => agents.get(id)).filter(Boolean);
+        roomList.push({...descriptor,agentCount:activeAgents.length,agents:activeAgents});
+      }
+    } catch (err) {
+      return res.json({rooms:roomList,backendErrors:{matrix:err.message},warnings:[`Matrix rooms unavailable: ${err.message}`]});
+    }
+  }
   res.json({ rooms: roomList });
 });
 
@@ -1542,6 +1646,7 @@ app.get("/api/rooms", (req, res) => {
 //   ?type=system   only messages of this type (e.g. purge join notices)
 app.delete("/api/messages/:room", (req, res) => {
   const { room } = req.params;
+  if (room.startsWith("matrix:")) return res.status(400).json({success:false,error:"Matrix history is owned by Matrix; use its event redaction operation."});
   const { before, type } = req.query;
   const confirm = req.query.confirm === "true" || req.body?.confirm === true;
 
@@ -1765,14 +1870,15 @@ app.get("/api/stats", (req, res) => {
     rooms: Array.from(rooms.entries()).map(([name, room]) => ({
       name,
       agentCount: room.agents.size,
-      messageCount: messages.get(name)?.length || 0,
+      messageCount: MatrixBackend.isMatrixRoom(name) ? null : (messages.get(name)?.length || 0),
+      ...(MatrixBackend.isMatrixRoom(name) ? {backend:'matrix',messageCountUnavailable:true} : {}),
       isActive: room.isActive,
     })),
   };
   res.json(stats);
 });
 
-app.post("/api/broadcast/:room", (req, res) => {
+app.post("/api/broadcast/:room", async (req, res) => {
   const { room: roomName } = req.params;
   const { content, from = "Orchestrator" } = req.body;
 
@@ -1789,6 +1895,12 @@ app.post("/api/broadcast/:room", (req, res) => {
       .json({ success: false, error: fromError, code: "INVALID_ARGUMENT" });
   }
 
+  if (roomName.startsWith('matrix:')) {
+    try {
+      const message=await matrix.sendMessage(roomName,{agentId:null,agentName:from,content,metadata:{type:'broadcast'}});
+      return res.json({success:true,messageId:message.id,backend:'matrix'});
+    } catch(err) { return matrixFailure(res,err); }
+  }
   // Create the room if it does not exist yet. Without this, broadcasting to a
   // room nobody had joined found no in-memory buffer, recordMessage dropped the
   // message, nothing was persisted — and the orchestrator was still told
@@ -2055,13 +2167,13 @@ io.on("connection", (socket) => {
     const agent = agents.get(agentId);
     if (agent) {
       agent.socketId = socket.id;
-      socket.join(room);
+      socket.join(agent.room);
       console.log(`Agent ${agent.name} registered with socket ${socket.id}`);
     }
   });
 
   socket.on("message", (data) => {
-    if (data.room) {
+    if (data.room && !MatrixBackend.isMatrixRoom(data.room)) {
       io.to(data.room).emit("message", data);
     }
   });
@@ -2087,6 +2199,7 @@ let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  matrixSyncStopped = true;
   logger.info(`${signal} received — draining pending database writes`);
 
   // Stop accepting new work. Socket.IO holds persistent connections, so
@@ -2115,6 +2228,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
 async function startServer() {
   await initializeSystem();
+  if (matrix.enabled) void runMatrixSync();
 
   // Storage hygiene: once at boot, then hourly. Unref so it never holds the
   // process open during shutdown.

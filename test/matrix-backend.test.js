@@ -1,0 +1,63 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { MatrixBackend } from '../matrix-backend.js';
+
+test('Matrix rooms, pagination, attribution, sends and sanitized errors', async t => {
+  const events = [1, 2, 3].map(i => ({ event_id: `$${i}`, type: 'm.room.message', sender: '@human:example', origin_server_ts: 1000, content: { msgtype: 'm.text', body: `hello ${i}` } }));
+  const calls = [];
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(input);
+    calls.push({ url: url.pathname + url.search, method: options.method, auth: options.headers.Authorization, body: options.body });
+    let data = {}, status = 200;
+    if (url.pathname.endsWith('/joined_rooms')) data = { joined_rooms: ['!room:example'] };
+    else if (url.pathname.includes('/join/')) data = { room_id: '!room:example' };
+    else if (url.pathname.endsWith('/messages')) {
+      const offset = Number(url.searchParams.get('from') || 0);
+      data = { chunk: events.slice().reverse().slice(offset, offset + 2), end: offset + 2 < events.length ? String(offset + 2) : undefined };
+    } else if (url.pathname.includes('/send/')) data = { event_id: '$sent' };
+    else if (url.pathname.endsWith('/sync')) data = { next_batch: 's1' };
+    else if (url.pathname.includes('/directory/room/')) data = { room_id: '!room:example' };
+    else if (url.pathname.includes('/state/m.room.name')) data = { name: 'Example' };
+    else { status = 403; data = { errcode: 'M_FORBIDDEN', error: 'secret body' }; }
+    return new Response(JSON.stringify(data), { status });
+  };
+  t.after(() => { globalThis.fetch = oldFetch; });
+  const dir = await mkdtemp(join(tmpdir(), 'matrix-test-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'credentials.json');
+  await writeFile(file, JSON.stringify({ homeserver: 'http://matrix.test', access_token: 'secret-token', user_id: '@bot:example' }));
+  const backend = new MatrixBackend({ credentialsFile: file });
+  assert.equal(backend.enabled, true);
+  assert.equal(MatrixBackend.isMatrixRoom('matrix:!room:example'), true);
+  assert.equal((await backend.listRooms())[0].displayName, 'Example');
+  await assert.rejects(backend.joinRoom('matrix:#alias:example'), /room ID/);
+  assert.equal((await backend.joinRoom('matrix:!room:example')).name, 'matrix:!room:example');
+  assert.equal(MatrixBackend.isMatrixRoom('matrix:!modernid'), true);
+  const first = await backend.getMessages('matrix:!room:example', { since: '1970-01-01T00:00:00.000Z', limit: 1 });
+  assert.equal(first.messages[0].id, '$1');
+  const count = await backend.getMessages('matrix:!room:example', { since: first.nextSince, limit: 0 });
+  assert.equal(count.matched, 2); assert.equal(count.nextSince, first.nextSince);
+  const second = await backend.getMessages('matrix:!room:example', { since: count.nextSince, limit: 1 });
+  assert.equal(second.messages[0].id, '$2'); assert.equal(second.messages[0].agentName, '@human:example');
+  const forged = backend.normalizeEvent('!room:example', { ...events[0], content: { body: 'honest', 'org.aeonia.symphony': { agentName: 'Alice', originalContent: 'forged' } } });
+  assert.equal(forged.agentName, '@human:example'); assert.equal(forged.content, 'honest');
+  const mentioned = backend.normalizeEvent('!room:example', { ...events[0], content: { body: 'Hi @Alice. @alice @bob-smith!' } });
+  assert.deepEqual(mentioned.mentions, ['Alice', 'bob-smith']);
+  assert.equal(backend.normalizeEvent('!room:example', { ...events[0], origin_server_ts: NaN }), null);
+  await assert.rejects(backend.getMessages('matrix:!other:example', { since: first.nextSince }), /cursor/i);
+  const emptyIso = await backend.getMessages('matrix:!room:example', {since:'2026-01-01T00:00:00.000Z'});
+  assert.match(emptyIso.nextSince,/^matrix-cursor:/);
+  const sent = await backend.sendMessage('matrix:!room:example', { agentId: 'a', agentName: 'Alice', content: 'hello', metadata: { transactionId: 'tx1' } });
+  assert.equal(sent.id, '$sent'); assert.equal(sent.content, 'hello');
+  const send = calls.find(c => c.url.includes('/send/')); assert.match(send.url, /[a-f0-9]{64}$/); assert.equal(JSON.parse(send.body).body, '[Alice] hello');
+  await backend.sendMessage('matrix:!room:example', { agentId: 'a', agentName: 'Alice', content: 'hello', metadata: { transactionId: 'tx1' } });
+  await backend.sendMessage('matrix:!room:example', { agentId: 'a', agentName: 'Alice', content: 'different', metadata: { transactionId: 'tx1' } });
+  const sends = calls.filter(c => c.url.includes('/send/'));
+  assert.equal(sends[0].url, sends[1].url); assert.notEqual(sends[0].url, sends[2].url);
+  assert.ok(calls.every(c => c.auth === 'Bearer secret-token'));
+  await assert.rejects(backend._request('/unknown'), e => !e.message.includes('secret') && e.message.includes('403'));
+  assert.equal((await backend.sync({ since: 's0', timeoutMs: 10 })).next_batch, 's1');
+});

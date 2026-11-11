@@ -12,7 +12,7 @@
  *   node groupmind-watch.cjs [--room groupmind] [--interval 60]
  *                            [--max-interval 600] [--request-timeout 30]
  *                            [--skip name,name] [--only name,name]
- *                            [--mentions-only] [--since ISO8601] [--debug]
+ *                            [--mentions-only] [--since CURSOR] [--debug]
  *
  * Config resolution (first hit wins):
  *   1. CLI flags
@@ -113,6 +113,7 @@ if (debug) {
 }
 
 let since = args.since || new Date().toISOString();
+let terminalFailure = false;
 // Only consecutive identical errors are suppressed: two alternating failures
 // (a flapping DNS error and an HTTP 502, say) will report on every tick. Left as
 // is deliberately — these go to stderr, so the cost is log noise, and a
@@ -134,6 +135,15 @@ async function fetchPage() {
     signal: AbortSignal.timeout(requestTimeoutMs),
   });
 
+  if (res.status >= 400 && res.status < 500) {
+    const detail = await res.clone().json().catch(() => ({}));
+    if (typeof detail.code === "string" && detail.code.startsWith("MATRIX_")) {
+      console.log(`[groupmind-watch] ERROR: ${detail.error || detail.code} Watcher stopped; resolve the Matrix error and choose a recovery cursor before restarting. No automatic cursor reset was attempted.`);
+      terminalFailure = true;
+      process.exitCode = 1;
+      return null;
+    }
+  }
   if (res.status === 401 || res.status === 403) {
     // Deliberately stdout, unlike every other diagnostic here. Under a
     // supervising monitor only stdout becomes a notification; stderr lands in a
@@ -168,7 +178,7 @@ async function fetchPage() {
   for (const m of messages) {
     // Advance before filtering: the cursor must pass over skipped messages too,
     // or they are re-fetched forever.
-    since = m.timestamp;
+    if (typeof data.nextSince !== "string" || !data.nextSince) since = m.timestamp;
     const who = m.agentName;
     if (skip.has(who)) {
       if (debug) console.error(`[groupmind-watch] skipping ${who}: in skip list`);
@@ -183,6 +193,9 @@ async function fetchPage() {
 
   if (debug && messages.length === 0) console.error(`[groupmind-watch] no new messages`);
 
+  // Server cursors can be opaque Matrix event cursors. Keep them verbatim,
+  // including after an empty page; timestamps are only for older hub versions.
+  if (typeof data.nextSince === "string" && data.nextSince) since = data.nextSince;
   return messages.length;
 }
 
@@ -193,9 +206,8 @@ async function poll() {
   let seen = 0;
   let failed = false;
   try {
-    // A full page means there may be more behind it. The cursor is exclusive on
-    // timestamp, so leaving a burst half-read risks dropping any message that
-    // shares a timestamp with the last one seen.
+    // A full page may have more behind it. Drain using the returned cursor;
+    // Matrix event cursors also distinguish messages sharing one timestamp.
     // fetchPage returns a count on success and null on an HTTP error. Zero and
     // null mean different things — "the room is quiet" versus "we could not
     // tell" — and conflating them made a hub answering 502 during a restart
@@ -249,6 +261,7 @@ function adjustInterval(seen) {
 // messages twice.
 async function loop() {
   adjustInterval(await poll());
+  if (terminalFailure) return;
   setTimeout(loop, intervalMs);
 }
 

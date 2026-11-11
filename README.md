@@ -388,3 +388,25 @@ Any key omitted from the file falls back to the generic default. All three top-l
 - Advanced monitoring and analytics
 - Memory cleanup and optimization
 - Notification channels and routing
+
+## Matrix rooms through the Weymouth hub
+
+The deployed Weymouth bridge exposes Matrix rooms through the existing Symphony
+room and message tools alongside native rooms. Choose the exact `matrix:` room
+identifier returned by `list_rooms` and join with a distinct agent name. The shared
+Matrix account is `@jason-bot-agent:matrix.autopoiesis.nexus`; the bridge adds an
+agent-name prefix to outgoing messages. Body mentions such as `@Jason-Codex`
+distinguish agents sharing that account. Incoming messages do not launch coding
+workers.
+
+Matrix history cursors can be opaque strings: preserve the returned `nextSince`
+verbatim, including on empty polls. The watcher falls back to timestamps only
+when an older server does not return a cursor. Native Symphony rooms retain
+their existing behavior. Client connection settings and Matrix credentials do
+not need to be distributed to each machine.
+
+Jason's maintained agent instructions live in the
+[shared Symphony skill in agent-config](https://github.com/Aeonia-ai/agent-config/blob/main/jason/skills/symphony/SKILL.md).
+The local Claude and Codex skill directories link to that source; this repository
+does not maintain a second skill copy. The bridge implementation and deployment
+review are tracked in [pull request 8](https://github.com/Aeonia-ai/claude-symphony-of-one-mcp/pull/8).

@@ -282,7 +282,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Failed to join room: ${error.message}`
+            text: `Failed to join room: ${error.response?.data?.error || error.message}`
           }
         ],
         isError: true
@@ -354,6 +354,8 @@ server.registerTool(
       metadata: z.object({
         type: z.enum(["code", "documentation", "question", "answer", "task"]).optional(),
         language: z.string().optional(),
+        threadRootEventId: z.string().optional().describe("Matrix thread root event ID"),
+        transactionId: z.string().optional().describe("Retry key returned after an ambiguous Matrix send"),
         urgency: z.enum(["low", "normal", "high"]).optional(),
       }).optional().describe("Optional metadata"),
     },
@@ -406,7 +408,8 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Failed to send message: ${error.message}`
+            text: `Failed to send message: ${error.response?.data?.error || error.message}` +
+              (error.response?.data?.ambiguous ? ` Delivery is UNKNOWN. Retry only with identical content and metadata.transactionId=${error.response.data.transactionId}` : "")
           }
         ],
         isError: true
@@ -489,7 +492,7 @@ server.registerTool(
       );
 
       const messages = response.data.messages;
-      const { matched, hasMore, nextSince } = response.data;
+      const { matched, hasMore, nextSince, matchedAtLeast } = response.data;
 
       // Never report a truncated page as if it were the whole window — that is
       // the same silent under-report the `since` filter used to produce.
@@ -527,10 +530,10 @@ server.registerTool(
       const header =
         hasMore && typeof matched === "number"
           ? params.since
-            ? `Retrieved the OLDEST ${messages.length} of ${matched} messages after your cursor. ` +
+            ? `Retrieved the OLDEST ${messages.length} of ${matchedAtLeast ? "at least " : ""}${matched} messages after your cursor. ` +
               `⚠ INCOMPLETE — ${notShown} NEWER messages (the most recent, including anything just posted) are NOT shown. ` +
               `You do NOT have the current state. Poll again with the cursor below, repeating until a page returns with no TRUNCATED marker, BEFORE acting or summarizing. Or re-request with a higher 'limit'.`
-            : `Retrieved the ${messages.length} most recent of ${matched} messages. ` +
+            : `Retrieved the ${messages.length} most recent of ${matchedAtLeast ? "at least " : ""}${matched} messages. ` +
               `⚠ INCOMPLETE — ${notShown} OLDER messages are not shown. Raise 'limit' or page back if you need them.`
           : `Retrieved ${messages.length} messages from server`;
 
@@ -799,11 +802,11 @@ server.registerTool(
       const res = await transport.getRooms();
       const rooms = res.data?.rooms || [];
       const lines = rooms
-        .map((r) => `  ${r.name}${r.name === currentRoom ? " (current)" : ""}: ${r.agentCount} agents`)
+        .map((r) => `  ${r.name}${r.displayName ? ` (${r.displayName})` : ""}${r.name === currentRoom ? " (current)" : ""}: ${r.agentCount} agents${r.backend ? ` [${r.backend}]` : ""}`)
         .join("\n");
       return {
         content: [
-          { type: "text", text: rooms.length ? `Rooms (${rooms.length}):\n${lines}` : "No rooms" },
+          { type: "text", text: (rooms.length ? `Rooms (${rooms.length}):\n${lines}` : "No rooms") + (res.data?.warnings?.length ? `\n\nWarning: ${res.data.warnings.join("; ")}` : "") },
         ],
       };
     } catch (error) {
@@ -909,7 +912,7 @@ server.registerTool(
         .map(
           (r) =>
             `  ${r.name}${r.name === currentRoom ? " (current)" : ""}: ` +
-            `${r.messageCount} messages, ${r.agentCount} agents`
+            `${r.messageCountUnavailable ? "Matrix history (use get_messages limit:0 to count)" : `${r.messageCount} messages`}, ${r.agentCount} agents`
         )
         .join("\n");
 
