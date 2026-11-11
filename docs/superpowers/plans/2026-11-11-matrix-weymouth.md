@@ -21,10 +21,10 @@ Gemini reviews the integrated change. No automatic coding worker.
   verify and resolve findings before enabling the change.
 - [x] Deploy an isolated candidate on Weymouth using its real local container;
   verify authenticated Matrix listing and native-room parity.
-- [ ] Activate candidate behind the existing Symphony service, then exercise
+- [x] Activate candidate behind the existing Symphony service, then exercise
   room_join, list_rooms, send_message, get_messages through a fresh MCP client.
   Use a temporary bot-owned room, verify restart/history and clean up membership.
-- [ ] Record deployed revision, proof and rollback in this execution record.
+- [x] Record deployed revision, proof and rollback in this execution record.
 
 Verification commands: npm test; node --test test/matrix-backend.test.js
  test/matrix-hub.test.js. Real integration must use the service's existing auth
@@ -67,3 +67,27 @@ suite passed after the first review fixes; focused Matrix/MCP tests were rerun
 for these final corrections. No high findings remained in the final review.
 
 Final full-suite result: 196 passed, zero failures. Final focused Matrix/MCP result: 32 passed.
+
+## Live deployment handback
+
+Weymouth now runs source commit bef64adcb1a77f28c98c9576ac76358cd859df45 from
+/home/jasbahr/Development/Aeonia/Utilities/symphony-matrix through the original
+symphony-hub.service and existing address. The original checkout, database,
+AUTH_TOKEN, DATA_DIR and FILE_STORE_DIR were preserved. A source-directory
+change must preserve those effective defaults; this deployment does so explicitly.
+
+The existing tools in the Eno chat, without a new client configuration, listed
+both room types, joined the temporary Matrix room, sent a named message and read
+it back. After restarting the production service, a fresh join/read returned the
+same Matrix history. The isolated candidate separately verified opaque cursor
+round-trip, native messaging, and a Matrix event arriving over Socket.IO with
+its original ID. The temporary room was scheduled for unlink/leave cleanup and
+the isolated candidate for shutdown immediately after these checks; the live
+receipt at /home/jasbahr/symphony-hub-data/matrix-deployment.json records completion.
+
+Service override: ~/.config/systemd/user/symphony-hub.service.d/60-matrix-room-backend.conf.
+Rollback removes only this override, reloads user systemd and restarts the service,
+returning to the original source. No automatic coding dispatcher is present.
+The original client transport still works for basic room/message tools; updated
+client code adds Matrix display labels, warning rendering and thread/retry fields.
+No merge to main has been performed. Gemini review remains required before merge.
