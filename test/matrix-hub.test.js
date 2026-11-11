@@ -57,6 +57,11 @@ describe('Matrix rooms through existing hub routes', () => {
     await api('/api/leave/mx',{});
     assert.equal((await api('/api/messages/'+encodeURIComponent(room))).body.messages.length,1);
   });
+  it('distinguishes invalid requests and unavailable cursors from backend outages',async()=>{
+    const invalid=await api('/api/messages/'+encodeURIComponent(room)+'?limit=-1');assert.equal(invalid.status,400);
+    const cursor='matrix-cursor:'+Buffer.from(JSON.stringify({room:'!test:example.test',event:'$missing'})).toString('base64url');
+    const stale=await api('/api/messages/'+encodeURIComponent(room)+'?since='+encodeURIComponent(cursor));assert.equal(stale.status,410);assert.equal(stale.body.code,'MATRIX_CURSOR_UNAVAILABLE');
+  });
   it('reports Matrix errors while native sending continues and auth still applies',async()=>{
     failed=true;
     assert.equal((await api('/api/messages/'+encodeURIComponent(room))).status,502);

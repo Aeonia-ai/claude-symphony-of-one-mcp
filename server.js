@@ -1119,7 +1119,7 @@ app.delete("/api/rooms/:room/files/*", async (req, res) => {
 // Matrix is a room backend, not a model or command dispatcher. The existing
 // Embassy container owns activation credentials; clients keep hub authentication.
 function matrixFailure(res, err) {
-  return res.status(err.status === 400 ? 400 : 502).json({success:false,code:'MATRIX_BACKEND_ERROR',error:err.message,
+  return res.status(err.status >= 400 && err.status < 500 ? err.status : 502).json({success:false,code:err.code || 'MATRIX_BACKEND_ERROR',error:err.message,
     ...(err.ambiguous ? {ambiguous:true,transactionId:err.transactionId,delivery:'unknown; retry only with this transactionId and identical content'} : {})});
 }
 const matrixSyncPath = process.env.SYMPHONY_MATRIX_SYNC_STATE || `${DB_PATH}.matrix-sync.json`;

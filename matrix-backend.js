@@ -6,6 +6,9 @@ import { randomUUID, createHash } from 'node:crypto';
 const execFileAsync = promisify(execFile);
 const API = '/_matrix/client/v3';
 const NS = 'org.aeonia.symphony';
+function matrixInputError(message, status = 400, code = 'MATRIX_INVALID_ARGUMENT') {
+  return Object.assign(new Error(message), {status, code});
+}
 
 export class MatrixBackend {
   constructor({ credentialsFile = process.env.SYMPHONY_MATRIX_CREDENTIALS_FILE, container = process.env.SYMPHONY_MATRIX_CONTAINER, timeoutMs = 30000 } = {}) {
@@ -59,7 +62,7 @@ export class MatrixBackend {
   }
 
   _roomId(room) {
-    if (!MatrixBackend.isMatrixRoom(room) || !room.startsWith('matrix:!')) throw new Error('Expected a canonical Matrix room ID');
+    if (!MatrixBackend.isMatrixRoom(room) || !room.startsWith('matrix:!')) throw matrixInputError('Expected a canonical Matrix room ID');
     return room.slice(7);
   }
   async _descriptor(id) {
@@ -77,7 +80,7 @@ export class MatrixBackend {
     return rooms;
   }
   async joinRoom(name) {
-    if (!MatrixBackend.isMatrixRoom(name)) throw new Error('Expected a canonical Matrix room ID; use an ID from the room list');
+    if (!MatrixBackend.isMatrixRoom(name)) throw matrixInputError('Expected a canonical Matrix room ID; use an ID from the room list');
     const id = name.slice(7);
     const joined = await this._request(`/join/${encodeURIComponent(id)}`, { method: 'POST', body: {} });
     if (!joined.room_id || joined.room_id !== id) throw new Error('Matrix join returned an unexpected room');
@@ -99,12 +102,13 @@ export class MatrixBackend {
   async getMessages(room, { since, limit = 100, mentioning } = {}) {
     const id = this._roomId(room);
     limit = Number(limit);
-    if (!Number.isInteger(limit) || limit < 0) throw new Error('Invalid message limit');
+    if (!Number.isInteger(limit) || limit < 0) throw matrixInputError('Invalid message limit');
+    if (since !== undefined && typeof since !== 'string') throw matrixInputError('Invalid since cursor');
     let anchor, sinceTime;
     if (since?.startsWith('matrix-cursor:')) {
-      try { const v = JSON.parse(Buffer.from(since.slice(14), 'base64url').toString()); if (v.room !== id || typeof v.event !== 'string') throw new Error(); anchor = v.event; } catch { throw new Error('Invalid or wrong-room Matrix cursor'); }
+      try { const v = JSON.parse(Buffer.from(since.slice(14), 'base64url').toString()); if (v.room !== id || typeof v.event !== 'string') throw new Error(); anchor = v.event; } catch { throw matrixInputError('Invalid or wrong-room Matrix cursor'); }
     } else if (since) {
-      if (!/(?:Z|[+-]\d\d:\d\d)$/i.test(since) || !Number.isFinite(Date.parse(since))) throw new Error('Invalid since timestamp');
+      if (!/(?:Z|[+-]\d\d:\d\d)$/i.test(since) || !Number.isFinite(Date.parse(since))) throw matrixInputError('Invalid since timestamp');
       sinceTime = Date.parse(since);
     }
     const collected = []; const edits = new Map(); let from, scanned = 0, found = false, newestEvent, truncated = false;
@@ -130,7 +134,7 @@ export class MatrixBackend {
       if (batch.end && batch.end === from) throw new Error('Matrix history pagination did not advance');
       from = batch.end;
     } while (from);
-    if (anchor && !found) throw new Error('Matrix cursor event is no longer available');
+    if (anchor && !found) throw matrixInputError('Saved Matrix cursor event is no longer available. Read available history without since to establish a new cursor; earlier history may be unavailable.', 410, 'MATRIX_CURSOR_UNAVAILABLE');
     collected.reverse();
     const matches = mentioning ? collected.filter(m => m.mentions.some(x => x.toLowerCase() === String(mentioning).replace(/^@/, '').toLowerCase())) : collected;
     const page = limit === 0 ? [] : since ? matches.slice(0, limit) : matches.slice(-limit);
@@ -143,7 +147,7 @@ export class MatrixBackend {
   }
   async sendMessage(room, { agentId, agentName, content, metadata = {} }) {
     const id = this._roomId(room);
-    if (typeof content !== 'string' || typeof agentName !== 'string') throw new Error('Invalid Matrix message');
+    if (typeof content !== 'string' || typeof agentName !== 'string') throw matrixInputError('Invalid Matrix message');
     const key = metadata.transactionId || randomUUID();
     const payloadMetadata = { ...metadata }; delete payloadMetadata.transactionId;
     const transactionId = createHash('sha256').update(JSON.stringify([key, id, agentId, agentName, content, payloadMetadata])).digest('hex');

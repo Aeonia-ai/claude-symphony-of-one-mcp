@@ -113,6 +113,7 @@ if (debug) {
 }
 
 let since = args.since || new Date().toISOString();
+let terminalFailure = false;
 // Only consecutive identical errors are suppressed: two alternating failures
 // (a flapping DNS error and an HTTP 502, say) will report on every tick. Left as
 // is deliberately — these go to stderr, so the cost is log noise, and a
@@ -134,6 +135,15 @@ async function fetchPage() {
     signal: AbortSignal.timeout(requestTimeoutMs),
   });
 
+  if (res.status >= 400 && res.status < 500) {
+    const detail = await res.clone().json().catch(() => ({}));
+    if (typeof detail.code === "string" && detail.code.startsWith("MATRIX_")) {
+      console.log(`[groupmind-watch] ERROR: ${detail.error || detail.code} Watcher stopped; resolve the Matrix error and choose a recovery cursor before restarting. No automatic cursor reset was attempted.`);
+      terminalFailure = true;
+      process.exitCode = 1;
+      return null;
+    }
+  }
   if (res.status === 401 || res.status === 403) {
     // Deliberately stdout, unlike every other diagnostic here. Under a
     // supervising monitor only stdout becomes a notification; stderr lands in a
@@ -251,6 +261,7 @@ function adjustInterval(seen) {
 // messages twice.
 async function loop() {
   adjustInterval(await poll());
+  if (terminalFailure) return;
   setTimeout(loop, intervalMs);
 }
 

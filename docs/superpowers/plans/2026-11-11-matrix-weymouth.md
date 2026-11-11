@@ -91,3 +91,26 @@ returning to the original source. No automatic coding dispatcher is present.
 The original client transport still works for basic room/message tools; updated
 client code adds Matrix display labels, warning rendering and thread/retry fields.
 No merge to main has been performed. Gemini review remains required before merge.
+
+## Authorized merge and combined watcher deployment — November 11
+
+Jason requested merge and deployment, followed by communication in Embassy.
+The bridge branch now includes the watcher/README guidance branch and current main.
+Gemini via Antigravity timed out without a verdict; the alternative OpenCode
+Gemini route reported insufficient OpenRouter credits. Neither is approval.
+Jason's instruction “can also use claude” authorizes the independent Claude
+alternative for this task; it supersedes this record's earlier Gemini-only hold
+for this merge, without changing the default review rule for other work.
+
+Independent normal-account Claude Opus review of the combined diff returned no
+high findings and one medium finding: invalid/unavailable Matrix cursors were
+misclassified as temporary backend failures. Verified and fixed: validation uses
+400, unavailable cursors use 410 with MATRIX_CURSOR_UNAVAILABLE, upstream 4xx
+statuses survive, and watchers report Matrix client errors and stop without
+silently resetting the cursor. Focused tests cover the failure and recovery
+boundary. The cited findAgentsByName helper exists in server.js.
+
+Final full suite: 200 tests passed, zero failed. Both maintained watcher copies
+also passed opaque cursor, empty-page cursor and legacy timestamp fallback
+checks. The previous deployed source bef64ad remains the immediate rollback
+revision; the original database and shared-file paths remain unchanged.

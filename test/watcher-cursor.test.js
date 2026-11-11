@@ -16,3 +16,11 @@ async function check(file,legacy=false){
 const watcher=fileURLToPath(new URL('../scripts/groupmind-watch/groupmind-watch.cjs',import.meta.url));
 test('watcher preserves opaque and empty-page server cursors',()=>check(watcher));
 test('watcher retains timestamp fallback for older servers',()=>check(watcher,true));
+
+test('watcher reports an unavailable Matrix cursor and stops without resetting it',async()=>{
+ const output=[],timers=[],calls=[];
+ const context={require:name=>name==='fs'?{readFileSync(){throw Error('no config')}}:require(name),process:{argv:['node',watcher,'--url','http://test.invalid','--since','matrix-cursor:missing'],env:{HOME:'/nonexistent'}},console:{log:m=>output.push(m),error:m=>output.push(m)},setTimeout:fn=>{timers.push(fn);return 1},clearTimeout(){},AbortSignal,URLSearchParams,fetch:async url=>{calls.push(new URL(url));return new Response(JSON.stringify({code:'MATRIX_CURSOR_UNAVAILABLE',error:'Saved Matrix cursor event is no longer available'}),{status:410,headers:{'content-type':'application/json'}})}};
+ await vm.runInNewContext(fs.readFileSync(watcher,'utf8'),context,{filename:watcher});
+ assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('since'),'matrix-cursor:missing');
+ assert.equal(context.process.exitCode,1);assert.equal(timers.length,0);assert.ok(output.some(s=>s.includes('cursor event is no longer available')));
+});
