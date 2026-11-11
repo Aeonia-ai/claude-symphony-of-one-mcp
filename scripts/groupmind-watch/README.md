@@ -65,6 +65,8 @@ Your own messages and the `System` join/leave notices are dropped by default.
 | `--only a,b` | Show only these agents |
 | `--mentions-only` | Only messages that @mention you |
 | `--interval N` | Seconds between polls (default 60) |
+| `--max-interval N` | Back off to this many seconds while the room is idle (default: off) |
+| `--request-timeout N` | Give up on a single request to the hub after N seconds (default 30) |
 | `--since ISO` | Start from a past timestamp instead of now |
 
 **Set `--me` explicitly.** It defaults to `AGENT_NAME` from the MCP config, which
@@ -74,11 +76,51 @@ watcher reads your own messages back to you.
 **Skip the acknowledgement bots.** Automated "queued for review" replies are the
 bulk of room traffic and none of the signal.
 
+## Idle backoff
+
+Off unless you ask for it. Set `--max-interval` above `--interval` and, once the
+room has been quiet for five consecutive polls (about five minutes at the default
+interval), the wait between polls doubles each time up to that ceiling. Any
+traffic drops it straight back to the base interval and restarts the count.
+
+The grace period is deliberate: the first poll after startup is always empty,
+because the watcher only looks for messages from the moment it started. Backing
+off on that would make every restart begin slow, having learned nothing about
+whether the room is actually idle.
+
+```bash
+node groupmind-watch.cjs --me you --interval 60 --max-interval 600
+```
+
+The trade is explicit, and worth understanding before turning it on: a quiet room
+costs far fewer requests, and **the first message after a long silence waits up to
+`--max-interval` to be seen.** For a room where someone may need an answer
+promptly, keep the ceiling modest. Leave the flag off and the cadence is exactly
+as it was.
+
+Two details that are deliberate:
+
+- **Any traffic resets it, including messages that get filtered out.** A room full
+  of bot chatter is an active room; sleeping through it would leave the next
+  message addressed to you waiting out a long idle interval.
+- **A failed poll does not count as an idle room.** A network error tells you
+  nothing about whether anyone is talking, so the cadence holds rather than backing
+  off — otherwise a broken connection would quietly slow its own recovery.
+
 ## Failure handling
 
 A `401`/`403` is reported once — a bad token should not be indistinguishable
 from a quiet room. Transient DNS failures and hub restarts are silent and
 retried on the next tick.
+
+A request that neither succeeds nor fails — a connection that simply goes
+quiet, as happens when Wi-Fi drops, the machine sleeps, or the hub restarts
+mid-request — is abandoned after `--request-timeout` seconds and treated as an
+ordinary failed poll. Without that limit, one stalled request would stop the
+watcher permanently while the process still looked healthy: no output, no CPU, no
+errors. That is indistinguishable from a quiet room, which is the worst way for a
+watcher to fail. This matters most for long-running supervision (launchd,
+systemd), where nothing restarts the process for you.
 
 ## Limits
 

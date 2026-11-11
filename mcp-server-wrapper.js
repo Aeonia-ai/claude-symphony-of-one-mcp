@@ -75,11 +75,13 @@ function getEnvironmentPaths() {
 // Main wrapper function
 function main() {
   const { serverPath, sharedDir, isWindows, isWSL } = getEnvironmentPaths();
+  const log = (...args) => console.error(...args);
 
-  console.log(`🎭 Symphony of One MCP Server Wrapper`);
-  console.log(`Environment: ${isWSL ? "WSL" : isWindows ? "Windows" : "Unix"}`);
-  console.log(`Server Path: ${serverPath}`);
-  console.log(`Shared Directory: ${sharedDir}`);
+  // Keep stdout reserved for MCP JSON-RPC traffic.
+  log(`🎭 Symphony of One MCP Server Wrapper`);
+  log(`Environment: ${isWSL ? "WSL" : isWindows ? "Windows" : "Unix"}`);
+  log(`Server Path: ${serverPath}`);
+  log(`Shared Directory: ${sharedDir}`);
 
   // Set environment variables
   const env = {
@@ -104,21 +106,21 @@ function main() {
 
   child.on("exit", (code, signal) => {
     if (signal) {
-      console.log(`🛑 MCP server terminated by signal: ${signal}`);
+      log(`🛑 MCP server terminated by signal: ${signal}`);
     } else {
-      console.log(`🔚 MCP server exited with code: ${code}`);
+      log(`🔚 MCP server exited with code: ${code}`);
     }
     process.exit(code || 0);
   });
 
   // Handle graceful shutdown
   process.on("SIGINT", () => {
-    console.log("\n🛑 Shutting down MCP server...");
+    log("\n🛑 Shutting down MCP server...");
     child.kill("SIGINT");
   });
 
   process.on("SIGTERM", () => {
-    console.log("\n🛑 Terminating MCP server...");
+    log("\n🛑 Terminating MCP server...");
     child.kill("SIGTERM");
   });
 }
